@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+out/
+dist/
+dist-electron/
+
+# TypeScript incremental build info
+*.tsbuildinfo
+
+# Generated screenshots (keep the README demo image)
+screenshots/*
+!screenshots/wired.png
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
