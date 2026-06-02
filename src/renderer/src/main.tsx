@@ -3,7 +3,7 @@ import ReactDOM from 'react-dom/client'
 import { App } from './App'
 import { useAudioStore } from './store/audioStore'
 import { useSettingsStore } from './store/settingsStore'
-import { audioEngine } from './audio/AudioEngine'
+import { audioEngine } from './audio/backend'
 import './index.css'
 
 // Expose for debugging / e2e tests

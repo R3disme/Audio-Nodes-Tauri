@@ -4,7 +4,7 @@ import { AudioHandle } from './AudioHandle'
 import { VUMeter } from '../VUMeter'
 import { VerticalSlider } from '../VerticalSlider'
 import { useAudioStore, type VolumeNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 function gainToDb(linear: number): string {
   if (linear <= 0) return '−∞ dB'
@@ -34,7 +34,7 @@ export function VolumeNode({ id, data, selected }: NodeProps): JSX.Element {
       id={id}
       nodeType="volume"
       label={d.label}
-      width={170 + (channels - 1) * 30}
+      width={200 + (channels - 1) * 34}
       selected={selected}
       channelControl={{ channels, onChange: n => setNodeChannels(id, 'volume', n) }}
     >

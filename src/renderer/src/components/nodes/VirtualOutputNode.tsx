@@ -4,7 +4,7 @@ import { NodeBase, SliderRow, DeviceSelector, MuteButton } from './NodeBase'
 import { AudioHandle } from './AudioHandle'
 import { StereoVUMeter } from '../VUMeter'
 import { useAudioStore, type OutputNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 /** Heuristic: surface likely virtual-cable devices so users can spot them. */
 function looksVirtual(label: string): boolean {
@@ -35,7 +35,7 @@ export function VirtualOutputNode({ id, data, selected }: NodeProps): JSX.Elemen
   }
 
   return (
-    <NodeBase id={id} nodeType="virtual" label={d.label} width={235} selected={selected}>
+    <NodeBase id={id} nodeType="virtual" label={d.label} width={248} selected={selected}>
       <AudioHandle type="target" id="in-0" nodeType="virtual" />
 
       <DeviceSelector

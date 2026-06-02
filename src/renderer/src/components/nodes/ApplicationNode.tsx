@@ -5,7 +5,7 @@ import { AudioHandle } from './AudioHandle'
 import { StereoVUMeter } from '../VUMeter'
 import { AppPicker } from '../AppPicker'
 import { useAudioStore, type ApplicationNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 import { AppWindow, RefreshCw, AlertCircle } from 'lucide-react'
 
 function useAppActive(id: string): boolean {

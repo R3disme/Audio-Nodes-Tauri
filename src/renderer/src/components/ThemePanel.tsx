@@ -54,6 +54,8 @@ export function ThemePanel(): JSX.Element | null {
   const resetTheme = useSettingsStore(s => s.resetTheme)
   const nodeScale = useSettingsStore(s => s.nodeScale)
   const setNodeScale = useSettingsStore(s => s.setNodeScale)
+  const engine = useSettingsStore(s => s.engine)
+  const setEngine = useSettingsStore(s => s.setEngine)
   const fileRef = useRef<HTMLInputElement>(null)
 
   if (!open) return null
@@ -181,7 +183,29 @@ export function ThemePanel(): JSX.Element | null {
           )}
         </div>
 
-        {/* Footer: global node scale */}
+        {/* Footer: audio engine + global node scale */}
+        <div className="px-4 py-3 flex items-center gap-3" style={{ borderTop: '1px solid var(--c-border)' }}>
+          <span className="text-[11px] shrink-0" style={{ color: 'var(--c-text-dim)' }}>Audio engine</span>
+          <div className="flex rounded overflow-hidden ring-1 ring-black/40 text-[10px] font-semibold">
+            {(['webaudio', 'native'] as const).map(k => (
+              <button
+                key={k}
+                onClick={() => setEngine(k)}
+                className="px-2.5 py-1 transition-colors"
+                style={{
+                  background: engine === k ? 'var(--c-accent)' : 'var(--c-surface-2)',
+                  color: engine === k ? '#1a1a1a' : 'var(--c-text-dim)'
+                }}
+                title={k === 'native' ? 'Rust engine (beta) — reloads to switch' : 'Web Audio engine (stable) — reloads to switch'}
+              >
+                {k === 'webaudio' ? 'Web Audio' : 'Native (beta)'}
+              </button>
+            ))}
+          </div>
+          <span className="text-[9px] leading-tight" style={{ color: 'var(--c-text-dim)' }}>
+            switching reloads
+          </span>
+        </div>
         <div className="px-4 py-3 flex items-center gap-3" style={{ borderTop: '1px solid var(--c-border)' }}>
           <span className="text-[11px] shrink-0" style={{ color: 'var(--c-text-dim)' }}>Node scale</span>
           <input type="range" min={0.7} max={1.5} step={0.05} value={nodeScale}

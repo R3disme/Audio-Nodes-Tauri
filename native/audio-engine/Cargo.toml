@@ -1,0 +1,31 @@
+[package]
+name = "audio-engine-native"
+version = "0.1.0"
+edition = "2021"
+description = "Native (Rust) audio engine for Audio Nodes"
+license = "MIT"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+napi = { version = "2", default-features = false, features = ["napi6"] }
+napi-derive = "2"
+# Cross-platform audio device I/O (WASAPI backend on Windows). Phase 1 uses it
+# for device enumeration; the capture/render streams build on the same Host.
+cpal = "0.15"
+# Lock-free SPSC ring buffer (device callbacks <-> engine) and a lock-free graph
+# snapshot pointer (control thread swaps, audio thread loads).
+ringbuf = "0.4"
+arc-swap = "1"
+
+[build-dependencies]
+napi-build = "2"
+
+# Still to add: windows (WASAPI per-process loopback), rubato (quality resampling),
+# biquad, realfft.
+
+[profile.release]
+lto = true
+strip = "symbols"

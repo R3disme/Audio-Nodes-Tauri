@@ -7,9 +7,11 @@
     "dev": "electron-vite dev",
     "start": "electron-vite dev",
     "build": "electron-vite build",
-    "preview": "electron-vite preview"
+    "preview": "electron-vite preview",
+    "build:native": "npm --prefix native/audio-engine install --no-audit --no-fund && npm --prefix native/audio-engine run build"
   },
   "dependencies": {
+    "audio-engine-native": "file:./native/audio-engine",
     "@electron-toolkit/preload": "^3.0.1",
     "@electron-toolkit/utils": "^3.0.0",
     "@xyflow/react": "^12.3.6",

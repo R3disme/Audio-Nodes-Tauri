@@ -7,8 +7,9 @@ import {
   themeFromImage,
   applyTheme
 } from '@renderer/lib/theme'
+import type { EngineKind } from '@renderer/audio/backend'
 
-// ── Persisted UI settings: theme, sidebar state, node scale ─────────────────
+// ── Persisted UI settings: theme, sidebar state, node scale, audio engine ───
 
 const STORAGE_KEY = 'audio-nodes.settings.v1'
 
@@ -16,6 +17,8 @@ interface PersistedSettings {
   theme: Theme
   sidebarCollapsed: boolean
   nodeScale: number
+  /** Which audio backend to use. 'webaudio' is the default during the migration. */
+  engine: EngineKind
 }
 
 function load(): PersistedSettings {
@@ -26,11 +29,12 @@ function load(): PersistedSettings {
       return {
         theme: { ...DEFAULT_THEME, ...p.theme, nodes: { ...DEFAULT_THEME.nodes, ...p.theme?.nodes } },
         sidebarCollapsed: p.sidebarCollapsed ?? false,
-        nodeScale: p.nodeScale ?? 1
+        nodeScale: p.nodeScale ?? 1,
+        engine: p.engine === 'native' ? 'native' : 'webaudio'
       }
     }
   } catch { /* ignore corrupt settings */ }
-  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1 }
+  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1, engine: 'webaudio' }
 }
 
 const applyNodeScale = (n: number): void =>
@@ -40,6 +44,7 @@ interface SettingsState {
   theme: Theme
   sidebarCollapsed: boolean
   nodeScale: number
+  engine: EngineKind
   themeEditorOpen: boolean
 
   setSimpleAccent: (hex: string) => void
@@ -56,6 +61,8 @@ interface SettingsState {
   toggleSidebar: () => void
   setNodeScale: (v: number) => void
   setThemeEditorOpen: (v: boolean) => void
+  /** Switch audio backend. Persists then reloads so the graph rebuilds cleanly. */
+  setEngine: (kind: EngineKind) => void
 }
 
 const initial = load()
@@ -69,9 +76,9 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
     set({ theme })
   }
   const persist = (): void => {
-    const { theme, sidebarCollapsed, nodeScale } = get()
+    const { theme, sidebarCollapsed, nodeScale, engine } = get()
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ theme, sidebarCollapsed, nodeScale }))
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ theme, sidebarCollapsed, nodeScale, engine }))
     } catch { /* storage full / unavailable — non-fatal */ }
   }
   // Persist after the current synchronous update settles.
@@ -81,6 +88,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
     theme: initial.theme,
     sidebarCollapsed: initial.sidebarCollapsed,
     nodeScale: initial.nodeScale,
+    engine: initial.engine,
     themeEditorOpen: false,
 
     setSimpleAccent: (hex) => {
@@ -149,6 +157,15 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
       afterChange()
     },
 
-    setThemeEditorOpen: (v) => set({ themeEditorOpen: v })
+    setThemeEditorOpen: (v) => set({ themeEditorOpen: v }),
+
+    setEngine: (kind) => {
+      if (get().engine === kind) return
+      set({ engine: kind })
+      persist()
+      // The live graph was built in the previous engine; reload so the chosen
+      // engine rebuilds it from persisted state instead of running half-migrated.
+      window.location.reload()
+    }
   }
 })

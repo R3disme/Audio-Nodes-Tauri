@@ -1,5 +1,5 @@
 import { useEffect, useRef } from 'react'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 interface VUMeterProps {
   nodeId: string

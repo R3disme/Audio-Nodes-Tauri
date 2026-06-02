@@ -4,7 +4,7 @@ import { NodeBase, SliderRow, handleY } from './NodeBase'
 import { AudioHandle } from './AudioHandle'
 import { VUMeter } from '../VUMeter'
 import { useAudioStore, type CompressorNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 export function CompressorNode({ id, data, selected }: NodeProps): JSX.Element {
   const d = data as unknown as CompressorNodeData
@@ -37,7 +37,7 @@ export function CompressorNode({ id, data, selected }: NodeProps): JSX.Element {
       id={id}
       nodeType="compressor"
       label={d.label}
-      width={260}
+      width={272}
       selected={selected}
       channelControl={{ channels, onChange: n => setNodeChannels(id, 'compressor', n) }}
     >
@@ -49,7 +49,7 @@ export function CompressorNode({ id, data, selected }: NodeProps): JSX.Element {
       ))}
 
       <div className="flex gap-3">
-        <div className="flex-1">
+        <div className="flex-1 min-w-0">
           <SliderRow label="Threshold" value={d.threshold} min={-60} max={0} step={0.5}
                      display={`${d.threshold.toFixed(0)} dB`} onChange={v => update('threshold', v)} />
           <SliderRow label="Knee" value={d.knee} min={0} max={40} step={0.5}

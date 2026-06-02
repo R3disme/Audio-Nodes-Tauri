@@ -4,6 +4,69 @@ import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 
 let pendingCaptureSourceId: string | null = null
 
+// ── Native audio engine (Rust) bridge ──────────────────────────────────────
+//
+// The Rust engine ships as a Node-API addon (`audio-engine-native`). It is
+// lazy-loaded and every access is fault-tolerant: if the addon hasn't been
+// built (`npm run build:native`) the app keeps running on the Web Audio engine,
+// which remains the default during the migration. Phase 0 only bridges
+// version/info/device-enumeration; the real graph + meter streaming arrives in
+// Phase 1.
+
+interface NativeAudioDevice {
+  id: string
+  name: string
+  isDefault: boolean
+}
+interface NativeAudioEngineInstance {
+  init(): void
+  isInitialized(): boolean
+  inputDevices(): NativeAudioDevice[]
+  outputDevices(): NativeAudioDevice[]
+  createNode(id: string, nodeType: string, channels: number, deviceId: string): void
+  setInputDevice(id: string, deviceId: string): void
+  setOutputDevice(id: string, deviceId: string): void
+  connect(source: string, target: string): void
+  disconnect(source: string, target: string): void
+  setGain(id: string, gain: number): void
+  setMuted(id: string, muted: boolean): void
+  destroyNode(id: string): void
+  meters(): Record<string, number>
+}
+interface NativeAudioModule {
+  version(): string
+  engineInfo(): { version: string; backend: string; audioReady: boolean }
+  NativeAudioEngine: new () => NativeAudioEngineInstance
+}
+
+let nativeMod: NativeAudioModule | null | undefined
+let nativeEngineInstance: NativeAudioEngineInstance | null = null
+
+async function loadNativeModule(): Promise<NativeAudioModule | null> {
+  if (nativeMod === undefined) {
+    try {
+      // `string`-typed (non-literal) specifier keeps the typecheck decoupled
+      // from the generated bindings and stops the bundler from inlining the .node.
+      const specifier: string = 'audio-engine-native'
+      nativeMod = (await import(specifier)) as NativeAudioModule
+    } catch (e) {
+      console.warn('[audio] native engine addon unavailable:', (e as Error).message)
+      nativeMod = null
+    }
+  }
+  return nativeMod
+}
+
+async function getNativeEngine(): Promise<NativeAudioEngineInstance | null> {
+  const mod = await loadNativeModule()
+  if (!mod) return null
+  if (!nativeEngineInstance) {
+    nativeEngineInstance = new mod.NativeAudioEngine()
+    nativeEngineInstance.init()
+  }
+  return nativeEngineInstance
+}
+
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 1400,
@@ -88,6 +151,42 @@ app.whenReady().then(() => {
   ipcMain.handle('arm-capture-source', async (_e, sourceId: string) => {
     pendingCaptureSourceId = sourceId
   })
+
+  // ── Native audio engine bridge (Rust) ─────────────────────────────────────
+  // Returns null/empty when the addon isn't built so the renderer can fall back.
+  ipcMain.handle('audio:version', async () => {
+    const mod = await loadNativeModule()
+    return mod ? mod.version() : null
+  })
+  ipcMain.handle('audio:info', async () => {
+    const mod = await loadNativeModule()
+    return mod ? mod.engineInfo() : null
+  })
+  ipcMain.handle('audio:get-devices', async () => {
+    const engine = await getNativeEngine()
+    if (!engine) return { inputs: [], outputs: [] }
+    return { inputs: engine.inputDevices(), outputs: engine.outputDevices() }
+  })
+  ipcMain.handle('audio:poll-meters', async () => {
+    const engine = await getNativeEngine()
+    return engine ? engine.meters() : {}
+  })
+
+  // Graph control — one-way; resolve the engine then apply.
+  const withEngine = (fn: (e: NativeAudioEngineInstance) => void): void => {
+    void getNativeEngine().then((e) => {
+      if (e) fn(e)
+    })
+  }
+  ipcMain.on('audio:create-node', (_e, id: string, type: string, channels: number, deviceId: string) =>
+    withEngine((e) => e.createNode(id, type, channels, deviceId)))
+  ipcMain.on('audio:set-output-device', (_e, id: string, deviceId: string) =>
+    withEngine((e) => e.setOutputDevice(id, deviceId)))
+  ipcMain.on('audio:connect', (_e, s: string, t: string) => withEngine((e) => e.connect(s, t)))
+  ipcMain.on('audio:disconnect', (_e, s: string, t: string) => withEngine((e) => e.disconnect(s, t)))
+  ipcMain.on('audio:set-gain', (_e, id: string, gain: number) => withEngine((e) => e.setGain(id, gain)))
+  ipcMain.on('audio:set-muted', (_e, id: string, muted: boolean) => withEngine((e) => e.setMuted(id, muted)))
+  ipcMain.on('audio:destroy-node', (_e, id: string) => withEngine((e) => e.destroyNode(id)))
 
   // Set up displayMedia handler. Allows the renderer to call getDisplayMedia
   // with `audio: 'loopback'` even when picking a non-browser window source.

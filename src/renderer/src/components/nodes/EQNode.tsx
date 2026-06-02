@@ -3,7 +3,7 @@ import { NodeBase, handleY } from './NodeBase'
 import { AudioHandle } from './AudioHandle'
 import { VerticalSlider } from '../VerticalSlider'
 import { useAudioStore, type EQNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 const FREQ_LABELS = ['80', '240', '1k', '3.5k', '10k']
 
@@ -30,7 +30,7 @@ export function EQNode({ id, data, selected }: NodeProps): JSX.Element {
       id={id}
       nodeType="eq"
       label={d.label}
-      width={250}
+      width={268}
       selected={selected}
       channelControl={{ channels, onChange: n => setNodeChannels(id, 'eq', n) }}
     >

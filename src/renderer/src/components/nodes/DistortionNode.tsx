@@ -3,7 +3,7 @@ import { NodeBase, SliderRow, handleY } from './NodeBase'
 import { AudioHandle } from './AudioHandle'
 import { VUMeter } from '../VUMeter'
 import { useAudioStore, type DistortionNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 export function DistortionNode({ id, data, selected }: NodeProps): JSX.Element {
   const d = data as unknown as DistortionNodeData

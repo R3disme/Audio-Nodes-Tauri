@@ -1,6 +1,8 @@
-import { type ReactNode } from 'react'
+import { type ReactNode, useEffect } from 'react'
 import { X, Plus, Minus } from 'lucide-react'
+import { useUpdateNodeInternals } from '@xyflow/react'
 import { useAudioStore } from '@renderer/store/audioStore'
+import { useSettingsStore } from '@renderer/store/settingsStore'
 import { DEFAULT_NODE_COLORS, darken } from '@renderer/lib/nodeColors'
 
 const headerIcons: Record<string, string> = {
@@ -36,7 +38,7 @@ interface NodeBaseProps {
 }
 
 export function NodeBase({
-  id, nodeType, label, children, width = 220, selected = false, channelControl
+  id, nodeType, label, children, width = 240, selected = false, channelControl
 }: NodeBaseProps): JSX.Element {
   const removeNode = useAudioStore(s => s.removeNode)
   const setNodeColor = useAudioStore(s => s.setNodeColor)
@@ -44,6 +46,17 @@ export function NodeBase({
     s => (s.nodes.find(n => n.id === id)?.data as { color?: string } | undefined)?.color
   )
   const icon = headerIcons[nodeType] ?? '▪'
+
+  // React Flow caches each node's handle geometry. When the channel count (which
+  // adds/moves sockets) or the global UI scale changes, the cache goes stale —
+  // edges then point at the wrong spot and freshly-added sockets aren't
+  // connectable. Re-measure on those changes. (Covers every NodeBase-based node;
+  // MixerNode also calls this directly for its own input-count changes.)
+  const updateNodeInternals = useUpdateNodeInternals()
+  const nodeScale = useSettingsStore(s => s.nodeScale)
+  useEffect(() => {
+    updateNodeInternals(id)
+  }, [id, channelControl?.channels, nodeScale, updateNodeInternals])
 
   // Per-node accent: an override (if set) or the themed type color. Exposed as a
   // scoped CSS var so the header and this node's sockets pick it up.
@@ -82,10 +95,12 @@ export function NodeBase({
           <span className="truncate drop-shadow-sm">{label}</span>
         </div>
 
-        <div className="flex items-center gap-1 shrink-0">
-          {/* Per-node color: click to recolor, right-click to reset to default */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {/* Per-node color: click to recolor, right-click to reset to default.
+              Sized as a comfortable tap target and separated from the action
+              cluster so it isn't accidentally clicked instead of a button. */}
           <label
-            className="relative w-3.5 h-3.5 rounded-full nodrag cursor-pointer ring-1 ring-black/40 hover:ring-white/40 transition-all shrink-0"
+            className="relative w-[18px] h-[18px] rounded-full nodrag cursor-pointer ring-1 ring-black/40 hover:ring-white/60 transition-colors shrink-0"
             title="Recolor node (right-click to reset)"
             style={{ background: swatchValue }}
             onContextMenu={e => { e.preventDefault(); setNodeColor(id, null) }}
@@ -94,36 +109,40 @@ export function NodeBase({
               type="color"
               value={swatchValue}
               onChange={e => setNodeColor(id, e.target.value)}
-              className="absolute inset-0 opacity-0 cursor-pointer"
+              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
             />
           </label>
 
           {channelControl && (
-            <div className="flex items-center gap-0.5 nodrag" title="Number of audio channels">
-              <button
-                onClick={() => channelControl.onChange(Math.max(min, channelControl.channels - 1))}
-                disabled={channelControl.channels <= min}
-                className="w-4 h-4 flex items-center justify-center rounded bg-black/30 text-white/70 hover:bg-black/50 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-              >
-                <Minus size={9} />
-              </button>
-              <span className="text-white/90 font-mono text-[10px] w-3 text-center">{channelControl.channels}</span>
-              <button
-                onClick={() => channelControl.onChange(Math.min(max, channelControl.channels + 1))}
-                disabled={channelControl.channels >= max}
-                className="w-4 h-4 flex items-center justify-center rounded bg-black/30 text-white/70 hover:bg-black/50 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-              >
-                <Plus size={9} />
-              </button>
-            </div>
+            <>
+              <span className="w-px h-4 bg-black/30" aria-hidden />
+              <div className="flex items-center gap-1 nodrag" title="Number of audio channels">
+                <button
+                  onClick={() => channelControl.onChange(Math.max(min, channelControl.channels - 1))}
+                  disabled={channelControl.channels <= min}
+                  className="w-5 h-5 flex items-center justify-center rounded bg-black/30 text-white/70 hover:bg-black/50 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                >
+                  <Minus size={11} />
+                </button>
+                <span className="text-white/90 font-mono text-[11px] w-3.5 text-center tabular-nums">{channelControl.channels}</span>
+                <button
+                  onClick={() => channelControl.onChange(Math.min(max, channelControl.channels + 1))}
+                  disabled={channelControl.channels >= max}
+                  className="w-5 h-5 flex items-center justify-center rounded bg-black/30 text-white/70 hover:bg-black/50 hover:text-white disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                >
+                  <Plus size={11} />
+                </button>
+              </div>
+            </>
           )}
 
+          <span className="w-px h-4 bg-black/30" aria-hidden />
           <button
-            className="text-white/60 hover:text-white hover:bg-black/30 rounded p-0.5 transition-colors nodrag"
+            className="w-5 h-5 flex items-center justify-center text-white/60 hover:text-white hover:bg-black/40 rounded transition-colors nodrag"
             onClick={() => removeNode(id)}
             title="Remove node"
           >
-            <X size={12} />
+            <X size={13} />
           </button>
         </div>
       </div>
@@ -159,7 +178,10 @@ export function SliderRow({ label, value, min, max, step = 0.01, display, onChan
         step={step}
         value={value}
         onChange={e => onChange(parseFloat(e.target.value))}
-        className="flex-1 h-1 appearance-none bg-zinc-700 rounded cursor-pointer accent-orange-400 nodrag"
+        // min-w-0 lets the slider actually shrink: a range input's intrinsic
+        // min-width would otherwise push the value readout out of the column and
+        // under the adjacent VU meters, clipping the trailing "%".
+        className="flex-1 min-w-0 h-1 appearance-none bg-zinc-700 rounded cursor-pointer accent-orange-400 nodrag"
       />
       <span className="text-zinc-300 text-[10px] w-12 text-right font-mono shrink-0">
         {display ?? value.toFixed(2)}

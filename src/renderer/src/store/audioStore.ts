@@ -15,7 +15,6 @@ import {
   type Connection
 } from '@xyflow/react'
 import {
-  audioEngine,
   DEFAULT_EQ_BANDS,
   DEFAULT_REVERB,
   DEFAULT_DELAY,
@@ -25,6 +24,7 @@ import {
   type EQBand,
   type AudioNodeType
 } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 // ── Node data types ───────────────────────────────────────────────────────
 

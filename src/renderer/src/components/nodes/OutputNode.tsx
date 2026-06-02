@@ -3,7 +3,7 @@ import { NodeBase, SliderRow, DeviceSelector, MuteButton } from './NodeBase'
 import { AudioHandle } from './AudioHandle'
 import { StereoVUMeter } from '../VUMeter'
 import { useAudioStore, type OutputNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 export function OutputNode({ id, data, selected }: NodeProps): JSX.Element {
   const d = data as unknown as OutputNodeData
@@ -27,7 +27,7 @@ export function OutputNode({ id, data, selected }: NodeProps): JSX.Element {
   }
 
   return (
-    <NodeBase id={id} nodeType="output" label={d.label} width={230} selected={selected}>
+    <NodeBase id={id} nodeType="output" label={d.label} width={248} selected={selected}>
       <AudioHandle type="target" id="in-0" nodeType="output" />
 
       <DeviceSelector

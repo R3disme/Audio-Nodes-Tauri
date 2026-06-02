@@ -15,6 +15,8 @@
 // React entirely. Re-rendering 7+ components per frame would be wasteful.
 // ────────────────────────────────────────────────────────────────────────────
 
+import type { AudioBackend } from './AudioBackend'
+
 export type AudioNodeType =
   | 'input'
   | 'output'
@@ -183,7 +185,7 @@ interface ConnectionRecord {
 
 // ── Engine ──────────────────────────────────────────────────────────────────
 
-class AudioEngine {
+class AudioEngine implements AudioBackend {
   private ctx: AudioContext | null = null
   private nodes = new Map<string, ManagedNode>()
   private connections: ConnectionRecord[] = []

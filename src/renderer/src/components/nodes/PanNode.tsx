@@ -3,7 +3,7 @@ import { NodeBase, SliderRow, handleY } from './NodeBase'
 import { AudioHandle } from './AudioHandle'
 import { VUMeter } from '../VUMeter'
 import { useAudioStore, type PanNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 function panLabel(pan: number): string {
   if (Math.abs(pan) < 0.02) return 'C'

@@ -1,10 +1,11 @@
-import { type NodeProps } from '@xyflow/react'
+import { useEffect } from 'react'
+import { type NodeProps, useUpdateNodeInternals } from '@xyflow/react'
 import { NodeBase, handleY } from './NodeBase'
 import { AudioHandle } from './AudioHandle'
 import { VUMeter } from '../VUMeter'
 import { VerticalSlider } from '../VerticalSlider'
 import { useAudioStore, type MixerNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 
 function gainToDb(linear: number): string {
   if (linear <= 0) return '−∞'
@@ -17,6 +18,13 @@ export function MixerNode({ id, data, selected }: NodeProps): JSX.Element {
   const updateNodeData = useAudioStore(s => s.updateNodeData)
   const channelCount = d.channelCount ?? 4
   const channelsState = d.channels_state ?? []
+
+  // Mixer has no channelControl in NodeBase, so re-measure its input sockets here
+  // whenever the input count changes (keeps edges aligned + sockets connectable).
+  const updateNodeInternals = useUpdateNodeInternals()
+  useEffect(() => {
+    updateNodeInternals(id)
+  }, [id, channelCount, updateNodeInternals])
 
   const setChannelGain = (ch: number, gain: number): void => {
     const channels_state = channelsState.map((c, i) => (i === ch ? { ...c, gain } : c))

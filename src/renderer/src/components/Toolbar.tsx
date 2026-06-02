@@ -5,7 +5,7 @@ import {
 } from 'lucide-react'
 import { useAudioStore } from '@renderer/store/audioStore'
 import { useSettingsStore } from '@renderer/store/settingsStore'
-import { audioEngine } from '@renderer/audio/AudioEngine'
+import { audioEngine } from '@renderer/audio/backend'
 import { GuidePanel } from './GuidePanel'
 import { PresetsPanel } from './PresetsPanel'
 
