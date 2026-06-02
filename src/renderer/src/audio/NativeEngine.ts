@@ -7,9 +7,10 @@
 // each frame and dispatched to the same `subscribeMeter` subscribers the Web
 // Audio engine uses, so VUMeter.tsx is unchanged.
 //
-// Phase 1 scope: input → [volume] → output with VU meters. Effect node types
-// (eq, gate, reverb, …) are created as transparent passthrough in the engine —
-// their parameter setters here are no-ops until those DSP nodes are ported.
+// Phase 2: every effect type runs real DSP in the engine. This class mirrors the
+// engine's connection list and last-set parameters so a channel-count change can
+// drop/replay connections and restore params (the engine recreates a node from
+// defaults when its channel count changes), exactly like the Web Audio engine.
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { AudioBackend } from './AudioBackend'
@@ -23,10 +24,27 @@ import type {
   PanParams
 } from './AudioEngine'
 
+interface Conn {
+  source: string
+  sourceChannel: number
+  target: string
+  targetChannel: number
+}
+
 class NativeEngine implements AudioBackend {
   private initialized = false
   private meterSubs = new Map<string, Set<(db: number) => void>>()
   private rafId: number | null = null
+
+  // Mirror of engine state so channel changes can be replayed losslessly.
+  private connections: Conn[] = []
+  private gains = new Map<string, number>()
+  private mutes = new Map<string, boolean>()
+  /** Per node: last value for each effect param, keyed `${param}#${index}`. */
+  private params = new Map<string, Map<string, { param: string; index: number; value: number }>>()
+
+  /** Latest per-channel compressor gain reduction, keyed `${id}#gr${ch}`. */
+  private grCache = new Map<string, number>()
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -63,6 +81,12 @@ class NativeEngine implements AudioBackend {
         .pollMeters()
         .then((frame) => {
           busy = false
+          // Split out compressor gain-reduction keys; dispatch the rest to meters.
+          for (const key in frame) {
+            if (key.includes('#gr')) {
+              this.grCache.set(key, frame[key])
+            }
+          }
           for (const [key, subs] of this.meterSubs) {
             const db = frame[key]
             if (db === undefined) continue
@@ -90,8 +114,33 @@ class NativeEngine implements AudioBackend {
     return () => {}
   }
 
-  getCompressorReduction(_id: string, _channel = 0): number {
-    return 0
+  getCompressorReduction(id: string, channel = 0): number {
+    return this.grCache.get(`${id}#gr${channel}`) ?? 0
+  }
+
+  // ── Param bookkeeping (so channel changes can replay) ──────────────────────
+
+  private recordParam(id: string, param: string, index: number, value: number): void {
+    let m = this.params.get(id)
+    if (!m) {
+      m = new Map()
+      this.params.set(id, m)
+    }
+    m.set(`${param}#${index}`, { param, index, value })
+  }
+
+  private setParam(id: string, param: string, index: number, value: number): void {
+    this.recordParam(id, param, index, value)
+    window.api.audio.setParam(id, param, index, value)
+  }
+
+  /** Re-send gain/mute/effect params after the engine recreated a node. */
+  private replayState(id: string): void {
+    const g = this.gains.get(id)
+    if (g !== undefined) window.api.audio.setGain(id, g)
+    if (this.mutes.get(id)) window.api.audio.setMuted(id, true)
+    const m = this.params.get(id)
+    if (m) for (const { param, index, value } of m.values()) window.api.audio.setParam(id, param, index, value)
   }
 
   // ── Input / application ───────────────────────────────────────────────────
@@ -130,14 +179,18 @@ class NativeEngine implements AudioBackend {
 
   async recoverOutputs(): Promise<void> {}
 
-  // ── Node creation (effects are passthrough in the engine for now) ──────────
+  // ── Node creation ─────────────────────────────────────────────────────────
 
   createVolumeNode(id: string, channels = 1): void {
     window.api.audio.createNode(id, 'volume', channels, '')
   }
 
-  createEQNode(id: string, channels = 1, _bands?: EQBand[]): void {
+  createEQNode(id: string, channels = 1, bands?: EQBand[]): void {
     window.api.audio.createNode(id, 'eq', channels, '')
+    // Push any non-default band gains.
+    bands?.forEach((b, i) => {
+      if (b.gain !== 0) this.setParam(id, 'eqband', i, b.gain)
+    })
   }
 
   createCompressorNode(id: string, channels = 1): void {
@@ -148,84 +201,199 @@ class NativeEngine implements AudioBackend {
     window.api.audio.createNode(id, 'gate', channels, '')
   }
 
-  createMixerNode(id: string, _channels = 4): void {
-    // One output meter; the engine treats the mixer as a passthrough for now.
-    window.api.audio.createNode(id, 'mixer', 1, '')
+  createMixerNode(id: string, channels = 4): void {
+    // Engine sizes the per-input gain bank to `channels`; output meter is single.
+    window.api.audio.createNode(id, 'mixer', channels, '')
   }
 
-  createReverbNode(id: string, channels = 1, _params?: ReverbParams): void {
+  createReverbNode(id: string, channels = 1, params?: ReverbParams): void {
     window.api.audio.createNode(id, 'reverb', channels, '')
+    if (params) {
+      this.setParam(id, 'mix', 0, params.mix)
+      this.setParam(id, 'decay', 0, params.decay)
+      this.setParam(id, 'predelay', 0, params.preDelay)
+    }
   }
 
-  createDelayNode(id: string, channels = 1, _params?: DelayParams): void {
+  createDelayNode(id: string, channels = 1, params?: DelayParams): void {
     window.api.audio.createNode(id, 'delay', channels, '')
+    if (params) {
+      this.setParam(id, 'time', 0, params.time)
+      this.setParam(id, 'feedback', 0, params.feedback)
+      this.setParam(id, 'mix', 0, params.mix)
+    }
   }
 
-  createChorusNode(id: string, channels = 1, _params?: ChorusParams): void {
+  createChorusNode(id: string, channels = 1, params?: ChorusParams): void {
     window.api.audio.createNode(id, 'chorus', channels, '')
+    if (params) {
+      this.setParam(id, 'rate', 0, params.rate)
+      this.setParam(id, 'depth', 0, params.depth)
+      this.setParam(id, 'mix', 0, params.mix)
+    }
   }
 
-  createDistortionNode(id: string, channels = 1, _params?: DistortionParams): void {
+  createDistortionNode(id: string, channels = 1, params?: DistortionParams): void {
     window.api.audio.createNode(id, 'distortion', channels, '')
+    if (params) {
+      this.setParam(id, 'drive', 0, params.drive)
+      this.setParam(id, 'mix', 0, params.mix)
+    }
   }
 
-  createPanNode(id: string, channels = 1, _params?: PanParams): void {
+  createPanNode(id: string, channels = 1, params?: PanParams): void {
     window.api.audio.createNode(id, 'pan', channels, '')
+    if (params) this.setParam(id, 'pan', 0, params.pan)
   }
 
   // ── Parameter updates ──────────────────────────────────────────────────
 
   setGain(id: string, linearGain: number, _channel?: number): void {
+    this.gains.set(id, linearGain)
     window.api.audio.setGain(id, linearGain)
   }
 
   muteNode(id: string, muted: boolean): void {
+    this.mutes.set(id, muted)
     window.api.audio.setMuted(id, muted)
   }
 
-  // Effect parameters are no-ops until the DSP nodes are ported (Phase 2).
-  setEQBand(_id: string, _bandIndex: number, _gain: number): void {}
-  setCompressor(
-    _id: string,
-    _params: Partial<{ threshold: number; knee: number; ratio: number; attack: number; release: number }>
-  ): void {}
-  setGate(_id: string, _params: Partial<{ threshold: number; attack: number; release: number }>): void {}
-  setMixerChannel(_id: string, _channel: number, _gain: number): void {}
-  setMixerMaster(id: string, gain: number): void {
-    window.api.audio.setGain(id, gain)
+  setEQBand(id: string, bandIndex: number, gain: number): void {
+    this.setParam(id, 'eqband', bandIndex, gain)
   }
-  setReverb(_id: string, _params: Partial<ReverbParams>): void {}
-  setDelay(_id: string, _params: Partial<DelayParams>): void {}
-  setChorus(_id: string, _params: Partial<ChorusParams>): void {}
-  setDistortion(_id: string, _params: Partial<DistortionParams>): void {}
-  setPan(_id: string, _pan: number): void {}
+
+  setCompressor(
+    id: string,
+    params: Partial<{ threshold: number; knee: number; ratio: number; attack: number; release: number }>
+  ): void {
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined) this.setParam(id, k, 0, v)
+    }
+  }
+
+  setGate(id: string, params: Partial<{ threshold: number; attack: number; release: number }>): void {
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined) this.setParam(id, k, 0, v)
+    }
+  }
+
+  setMixerChannel(id: string, channel: number, gain: number): void {
+    this.setParam(id, 'channel', channel, gain)
+  }
+
+  setMixerMaster(id: string, gain: number): void {
+    this.setParam(id, 'master', 0, gain)
+  }
+
+  setReverb(id: string, params: Partial<ReverbParams>): void {
+    if (params.mix !== undefined) this.setParam(id, 'mix', 0, params.mix)
+    if (params.decay !== undefined) this.setParam(id, 'decay', 0, params.decay)
+    if (params.preDelay !== undefined) this.setParam(id, 'predelay', 0, params.preDelay)
+  }
+
+  setDelay(id: string, params: Partial<DelayParams>): void {
+    if (params.time !== undefined) this.setParam(id, 'time', 0, params.time)
+    if (params.feedback !== undefined) this.setParam(id, 'feedback', 0, params.feedback)
+    if (params.mix !== undefined) this.setParam(id, 'mix', 0, params.mix)
+  }
+
+  setChorus(id: string, params: Partial<ChorusParams>): void {
+    if (params.rate !== undefined) this.setParam(id, 'rate', 0, params.rate)
+    if (params.depth !== undefined) this.setParam(id, 'depth', 0, params.depth)
+    if (params.mix !== undefined) this.setParam(id, 'mix', 0, params.mix)
+  }
+
+  setDistortion(id: string, params: Partial<DistortionParams>): void {
+    if (params.drive !== undefined) this.setParam(id, 'drive', 0, params.drive)
+    if (params.mix !== undefined) this.setParam(id, 'mix', 0, params.mix)
+  }
+
+  setPan(id: string, pan: number): void {
+    this.setParam(id, 'pan', 0, pan)
+  }
 
   // ── Routing + channel reconfiguration ──────────────────────────────────────
 
-  connect(sourceId: string, _sourceChannel: number, targetId: string, _targetChannel: number): boolean {
-    window.api.audio.connect(sourceId, targetId)
+  connect(sourceId: string, sourceChannel: number, targetId: string, targetChannel: number): boolean {
+    if (
+      this.connections.some(
+        (c) =>
+          c.source === sourceId &&
+          c.target === targetId &&
+          c.sourceChannel === sourceChannel &&
+          c.targetChannel === targetChannel
+      )
+    ) {
+      return false
+    }
+    this.connections.push({ source: sourceId, sourceChannel, target: targetId, targetChannel })
+    window.api.audio.connect(sourceId, sourceChannel, targetId, targetChannel)
     return true
   }
 
-  disconnect(sourceId: string, _sourceChannel: number, targetId: string, _targetChannel: number): void {
-    window.api.audio.disconnect(sourceId, targetId)
+  disconnect(sourceId: string, sourceChannel: number, targetId: string, targetChannel: number): void {
+    this.connections = this.connections.filter(
+      (c) =>
+        !(
+          c.source === sourceId &&
+          c.target === targetId &&
+          c.sourceChannel === sourceChannel &&
+          c.targetChannel === targetChannel
+        )
+    )
+    window.api.audio.disconnect(sourceId, sourceChannel, targetId, targetChannel)
   }
 
   setChannelCount(id: string, type: AudioNodeType, channels: number): number {
     const n = Math.max(1, Math.min(8, channels))
-    // Recreate the node with the new channel count (engine replaces it by id).
-    window.api.audio.createNode(id, type, type === 'mixer' ? 1 : n, '')
+
+    // Connections that still fit the new channel range survive; the rest are dropped.
+    const survivingFrom = this.connections.filter((c) => c.source === id && c.sourceChannel < n)
+    const survivingTo = this.connections.filter((c) => c.target === id && c.targetChannel < n)
+    const survivingFiltered = [...survivingFrom, ...survivingTo]
+
+    // Tear down every connection touching this node (engine + mirror).
+    for (const c of this.connections.filter((c) => c.source === id || c.target === id)) {
+      window.api.audio.disconnect(c.source, c.sourceChannel, c.target, c.targetChannel)
+    }
+    this.connections = this.connections.filter((c) => c.source !== id && c.target !== id)
+
+    // Recreate the node with the new channel count (engine replaces it by id),
+    // then restore its gain/mute/params.
+    window.api.audio.createNode(id, type, n, '')
+    this.replayState(id)
+
+    // Replay the connections that still fit.
+    for (const c of survivingFiltered) {
+      this.connect(c.source, c.sourceChannel, c.target, c.targetChannel)
+    }
     return n
   }
 
   getConnectionsBeyondChannel(
-    _id: string,
-    _channels: number
+    id: string,
+    channels: number
   ): Array<{ source: string; target: string; sourceChannel: number; targetChannel: number }> {
-    return []
+    return this.connections
+      .filter(
+        (c) =>
+          (c.source === id && c.sourceChannel >= channels) ||
+          (c.target === id && c.targetChannel >= channels)
+      )
+      .map((c) => ({
+        source: c.source,
+        target: c.target,
+        sourceChannel: c.sourceChannel,
+        targetChannel: c.targetChannel
+      }))
   }
 
   destroyNode(id: string): void {
+    this.connections = this.connections.filter((c) => c.source !== id && c.target !== id)
+    this.gains.delete(id)
+    this.mutes.delete(id)
+    this.params.delete(id)
+    for (const key of this.grCache.keys()) if (key.startsWith(`${id}#gr`)) this.grCache.delete(key)
     window.api.audio.destroyNode(id)
   }
 

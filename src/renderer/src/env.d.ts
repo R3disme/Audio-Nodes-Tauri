@@ -41,10 +41,11 @@ interface Window {
       getDevices: () => Promise<{ inputs: NativeAudioDevice[]; outputs: NativeAudioDevice[] }>
       createNode: (id: string, nodeType: string, channels: number, deviceId: string) => void
       setOutputDevice: (id: string, deviceId: string) => void
-      connect: (source: string, target: string) => void
-      disconnect: (source: string, target: string) => void
+      connect: (source: string, sourceChannel: number, target: string, targetChannel: number) => void
+      disconnect: (source: string, sourceChannel: number, target: string, targetChannel: number) => void
       setGain: (id: string, gain: number) => void
       setMuted: (id: string, muted: boolean) => void
+      setParam: (id: string, param: string, index: number, value: number) => void
       destroyNode: (id: string) => void
       pollMeters: () => Promise<Record<string, number>>
     }

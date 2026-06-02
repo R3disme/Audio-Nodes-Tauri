@@ -26,10 +26,11 @@ interface NativeAudioEngineInstance {
   createNode(id: string, nodeType: string, channels: number, deviceId: string): void
   setInputDevice(id: string, deviceId: string): void
   setOutputDevice(id: string, deviceId: string): void
-  connect(source: string, target: string): void
-  disconnect(source: string, target: string): void
+  connect(source: string, sourceChannel: number, target: string, targetChannel: number): void
+  disconnect(source: string, sourceChannel: number, target: string, targetChannel: number): void
   setGain(id: string, gain: number): void
   setMuted(id: string, muted: boolean): void
+  setParam(id: string, param: string, index: number, value: number): void
   destroyNode(id: string): void
   meters(): Record<string, number>
 }
@@ -182,10 +183,14 @@ app.whenReady().then(() => {
     withEngine((e) => e.createNode(id, type, channels, deviceId)))
   ipcMain.on('audio:set-output-device', (_e, id: string, deviceId: string) =>
     withEngine((e) => e.setOutputDevice(id, deviceId)))
-  ipcMain.on('audio:connect', (_e, s: string, t: string) => withEngine((e) => e.connect(s, t)))
-  ipcMain.on('audio:disconnect', (_e, s: string, t: string) => withEngine((e) => e.disconnect(s, t)))
+  ipcMain.on('audio:connect', (_e, s: string, sc: number, t: string, tc: number) =>
+    withEngine((e) => e.connect(s, sc, t, tc)))
+  ipcMain.on('audio:disconnect', (_e, s: string, sc: number, t: string, tc: number) =>
+    withEngine((e) => e.disconnect(s, sc, t, tc)))
   ipcMain.on('audio:set-gain', (_e, id: string, gain: number) => withEngine((e) => e.setGain(id, gain)))
   ipcMain.on('audio:set-muted', (_e, id: string, muted: boolean) => withEngine((e) => e.setMuted(id, muted)))
+  ipcMain.on('audio:set-param', (_e, id: string, param: string, index: number, value: number) =>
+    withEngine((e) => e.setParam(id, param, index, value)))
   ipcMain.on('audio:destroy-node', (_e, id: string) => withEngine((e) => e.destroyNode(id)))
 
   // Set up displayMedia handler. Allows the renderer to call getDisplayMedia

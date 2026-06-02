@@ -1,28 +1,39 @@
 // ────────────────────────────────────────────────────────────────────────────
-// Phase 1 audio engine — input → [volume] → output, with VU meters.
+// Phase 2 audio engine — real multi-channel DSP graph.
 //
 // Threading
-//   • A dedicated **audio thread** owns every cpal `Stream` (they are `!Send`, so
-//     they must never cross threads). It only receives stream-create/drop
-//     commands; the streams' own callbacks run on cpal's realtime threads.
+//   • A dedicated **audio thread** owns every cpal `Stream` (they are `!Send`).
+//     It only receives stream-create/drop commands; the streams' own callbacks
+//     run on cpal's realtime threads.
 //   • The napi object (control thread = JS main) holds only `Send + Sync` shared
-//     state: the node registry, per-output route snapshots (`ArcSwap`), and meter
-//     atomics. Param/topology edits touch that state directly — no rebuilds.
+//     state: the node registry, the directed edge list, and a published
+//     `GraphSnapshot` (`ArcSwap`). Param edits hit lock-free atomics or a brief
+//     per-node mutex; topology edits rebuild the snapshot. No audio-thread
+//     round-trip for either.
 //
-// Audio flow
-//   input device ─cpal capture─▶ SPSC ring buffer ─▶ output callback pulls,
-//   walks the route (gain nodes), writes to the output device + updates meters.
+// Audio flow (pull model)
+//   Each output stream callback evaluates the graph by walking *backwards* from
+//   its own node: `eval(node, channel)` sums the node's upstream inputs, runs the
+//   node's per-channel DSP, updates that channel's meter, and returns a block.
+//   Input nodes pop from their capture ring buffer. A per-block cache pops each
+//   input exactly once so fan-out within one output's graph is correct.
 //
-// Scope / limitations (Phase 1 slice — documented, not bugs):
-//   • Linear chains input→[volume|passthrough]*→output. Fan-in (mixer) takes the
-//     first source only; other effect types are treated as transparent passthrough.
-//   • No resampling yet: input and output should run at the same sample rate
-//     (48 kHz is the usual Windows default). A mismatch is logged and will drift.
-//   • One output device is the common case; multiple outputs each pull the shared
-//     input ring buffer (contended) — fine for the slice, revisited later.
+// Channels
+//   Effect nodes carry 1–8 independent signal paths (channel 0 never bleeds into
+//   channel 1) — each channel has its own DSP state. Edges carry source/target
+//   channel indices. The mixer is the asymmetric case: many input channels (each
+//   with its own gain) fold into a single output.
+//
+// Scope / limitations (documented, not bugs):
+//   • No resampling: input and output should run at the same sample rate (48 kHz
+//     is the usual Windows default). A mismatch drifts.
+//   • Multiple outputs each pull the shared input ring buffer (contended); the
+//     common single-output case is correct.
+//   • Reverb is an algorithmic (Freeverb-style) approximation, not the convolution
+//     reverb of the Web Audio engine.
 // ────────────────────────────────────────────────────────────────────────────
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
@@ -36,6 +47,7 @@ use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 const MAX_BLOCK_FRAMES: usize = 8192;
 const RING_FRAMES: usize = 48_000; // ~1s of stereo headroom
+const MAX_DEPTH: u32 = 64; // graph-recursion / cycle guard
 
 // ── Meters (lock-free f32 in an AtomicU32) ──────────────────────────────────
 
@@ -44,8 +56,11 @@ impl Meter {
     fn new() -> Self {
         Meter(AtomicU32::new((-72f32).to_bits()))
     }
-    fn set(&self, db: f32) {
-        self.0.store(db.to_bits(), Ordering::Relaxed);
+    fn with(v: f32) -> Self {
+        Meter(AtomicU32::new(v.to_bits()))
+    }
+    fn set(&self, v: f32) {
+        self.0.store(v.to_bits(), Ordering::Relaxed);
     }
     fn get(&self) -> f32 {
         f32::from_bits(self.0.load(Ordering::Relaxed))
@@ -60,15 +75,36 @@ fn rms_to_db(rms: f32) -> f32 {
     }
 }
 
+fn rms(buf: &[f32]) -> f32 {
+    if buf.is_empty() {
+        return 0.0;
+    }
+    let sum: f32 = buf.iter().map(|s| s * s).sum();
+    (sum / buf.len() as f32).sqrt()
+}
+
+// ── DSP processors (one instance per node channel; interleaved stereo) ───────
+
+mod dsp;
+use dsp::Dsp;
+
 // ── Node kinds the engine understands ───────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
     Input,
     Output,
     Volume,
-    /// Any node type not yet ported (eq, gate, reverb, …) — audio passes through
-    /// it untouched so the chain still produces sound in native mode.
+    Mixer,
+    Eq,
+    Compressor,
+    Gate,
+    Reverb,
+    Delay,
+    Chorus,
+    Distortion,
+    Pan,
+    /// Anything unmapped — audio passes through untouched.
     Passthrough,
 }
 
@@ -78,40 +114,55 @@ impl Kind {
             "input" | "application" => Kind::Input,
             "output" | "virtual" => Kind::Output,
             "volume" => Kind::Volume,
+            "mixer" => Kind::Mixer,
+            "eq" => Kind::Eq,
+            "compressor" => Kind::Compressor,
+            "gate" => Kind::Gate,
+            "reverb" => Kind::Reverb,
+            "delay" => Kind::Delay,
+            "chorus" => Kind::Chorus,
+            "distortion" => Kind::Distortion,
+            "pan" => Kind::Pan,
             _ => Kind::Passthrough,
         }
+    }
+    /// DSP kinds carry one processor per channel; gain/routing kinds carry none.
+    fn dsp_kind(self) -> bool {
+        matches!(
+            self,
+            Kind::Eq
+                | Kind::Compressor
+                | Kind::Gate
+                | Kind::Reverb
+                | Kind::Delay
+                | Kind::Chorus
+                | Kind::Distortion
+                | Kind::Pan
+        )
     }
 }
 
 pub struct NodeState {
     kind: Kind,
-    /// Linear gain (f32 bits). Applies to input/output/volume nodes.
+    channels: usize,
+    /// Linear gain (f32 bits). Input/output/volume scalar gain, and mixer master.
     gain: AtomicU32,
     muted: AtomicBool,
-    /// One meter per channel (slice fills them all with the same level).
+    /// One meter per channel (mixer/input/output have a single output meter).
     meters: Vec<Arc<Meter>>,
     /// Input nodes only: the consumer end of the capture ring buffer.
     consumer: Mutex<Option<HeapCons<f32>>>,
-    /// Output nodes only: the live route the callback renders.
-    route: Option<Arc<ArcSwap<Route>>>,
+    /// DSP nodes only: per-channel processor state (locked only by the one audio
+    /// callback that renders this node; control-thread param edits also lock it
+    /// briefly).
+    dsp: Vec<Mutex<Dsp>>,
+    /// Mixer only: per-input-channel gains (lock-free).
+    mixer_gains: Vec<AtomicU32>,
+    /// Compressor only: per-channel gain-reduction readout (dB, ≤ 0).
+    reduction: Vec<Arc<Meter>>,
 }
 
 impl NodeState {
-    fn new(kind: Kind, channels: usize) -> Arc<NodeState> {
-        let meters = (0..channels.max(1)).map(|_| Arc::new(Meter::new())).collect();
-        Arc::new(NodeState {
-            kind,
-            gain: AtomicU32::new(1f32.to_bits()),
-            muted: AtomicBool::new(false),
-            meters,
-            consumer: Mutex::new(None),
-            route: if kind == Kind::Output {
-                Some(Arc::new(ArcSwap::from_pointee(Route::empty())))
-            } else {
-                None
-            },
-        })
-    }
     fn gain_lin(&self) -> f32 {
         if self.muted.load(Ordering::Relaxed) {
             0.0
@@ -119,25 +170,36 @@ impl NodeState {
             f32::from_bits(self.gain.load(Ordering::Relaxed))
         }
     }
-    fn set_all_meters(&self, db: f32) {
+    fn reset_meters(&self) {
         for m in &self.meters {
-            m.set(db);
+            m.set(-72.0);
+        }
+        for r in &self.reduction {
+            r.set(0.0);
         }
     }
 }
 
-/// A flattened render plan for one output, recomputed on topology changes.
-struct Route {
-    /// The input node feeding this output (after tracing back through the chain).
-    source: Option<Arc<NodeState>>,
-    /// Gain-bearing chain nodes (volumes + this output) whose gains multiply.
-    gain_nodes: Vec<Arc<NodeState>>,
-    /// Every non-source chain node — their meters get the post-gain level.
-    level_nodes: Vec<Arc<NodeState>>,
+// ── Edges + published graph snapshot ─────────────────────────────────────────
+
+#[derive(Clone)]
+struct Edge {
+    src: String,
+    src_ch: usize,
+    tgt: String,
+    tgt_ch: usize,
 }
-impl Route {
-    fn empty() -> Route {
-        Route { source: None, gain_nodes: vec![], level_nodes: vec![] }
+
+/// Immutable view the audio callbacks evaluate against. Rebuilt on any topology
+/// change and published via `ArcSwap`, so callbacks read it lock-free.
+struct GraphSnapshot {
+    nodes: HashMap<String, Arc<NodeState>>,
+    /// Edges grouped by target id (the inputs feeding each node).
+    incoming: HashMap<String, Vec<Edge>>,
+}
+impl GraphSnapshot {
+    fn empty() -> GraphSnapshot {
+        GraphSnapshot { nodes: HashMap::new(), incoming: HashMap::new() }
     }
 }
 
@@ -154,8 +216,8 @@ enum Command {
 
 struct Shared {
     nodes: Mutex<HashMap<String, Arc<NodeState>>>,
-    /// Directed edges (source_id → target_id). Channels are ignored in the slice.
-    edges: Mutex<Vec<(String, String)>>,
+    edges: Mutex<Vec<Edge>>,
+    snapshot: ArcSwap<GraphSnapshot>,
 }
 
 pub struct Engine {
@@ -168,6 +230,7 @@ impl Engine {
         let shared = Arc::new(Shared {
             nodes: Mutex::new(HashMap::new()),
             edges: Mutex::new(Vec::new()),
+            snapshot: ArcSwap::from_pointee(GraphSnapshot::empty()),
         });
         let (tx, rx) = channel::<Command>();
         let thread_shared = shared.clone();
@@ -182,7 +245,46 @@ impl Engine {
 
     pub fn create_node(&self, id: &str, node_type: &str, channels: u32, device_id: &str) {
         let kind = Kind::from_type(node_type);
-        let node = NodeState::new(kind, channels.max(1) as usize);
+        let ch = (channels.max(1)) as usize;
+
+        let meters_count = match kind {
+            Kind::Mixer | Kind::Input | Kind::Output => 1,
+            _ => ch,
+        };
+        let meters = (0..meters_count).map(|_| Arc::new(Meter::new())).collect();
+
+        let mut dsp: Vec<Mutex<Dsp>> = Vec::new();
+        let mut reduction: Vec<Arc<Meter>> = Vec::new();
+        if kind.dsp_kind() {
+            for _ in 0..ch {
+                if kind == Kind::Compressor {
+                    let r = Arc::new(Meter::with(0.0));
+                    reduction.push(r.clone());
+                    dsp.push(Mutex::new(Dsp::new(kind, Some(r))));
+                } else {
+                    dsp.push(Mutex::new(Dsp::new(kind, None)));
+                }
+            }
+        }
+
+        let mixer_gains = if kind == Kind::Mixer {
+            (0..ch).map(|_| AtomicU32::new(1f32.to_bits())).collect()
+        } else {
+            Vec::new()
+        };
+
+        let node = Arc::new(NodeState {
+            kind,
+            channels: ch,
+            gain: AtomicU32::new(1f32.to_bits()),
+            muted: AtomicBool::new(false),
+            meters,
+            consumer: Mutex::new(None),
+            dsp,
+            mixer_gains,
+            reduction,
+        });
+
         self.shared.nodes.lock().unwrap().insert(id.to_string(), node);
         match kind {
             Kind::Input => {
@@ -199,11 +301,10 @@ impl Engine {
             }
             _ => {}
         }
-        self.recompute_routes();
+        self.recompute();
     }
 
     pub fn set_input_device(&self, id: &str, device_id: &str) {
-        // Rebuild the capture stream on the new device; the node + consumer slot stay.
         let _ = self.tx.send(Command::DropStream { id: id.to_string() });
         let _ = self.tx.send(Command::CreateInputStream {
             id: id.to_string(),
@@ -217,7 +318,7 @@ impl Engine {
             id: id.to_string(),
             device_id: device_id.to_string(),
         });
-        self.recompute_routes();
+        self.recompute();
     }
 
     pub fn set_gain(&self, id: &str, gain: f64) {
@@ -232,22 +333,55 @@ impl Engine {
         }
     }
 
-    pub fn connect(&self, source: &str, target: &str) {
-        self.shared
-            .edges
-            .lock()
-            .unwrap()
-            .push((source.to_string(), target.to_string()));
-        self.recompute_routes();
+    /// Generic effect-parameter setter. `index` selects an EQ band or mixer input
+    /// channel; it is ignored by scalar params.
+    pub fn set_param(&self, id: &str, param: &str, index: u32, value: f64) {
+        let nodes = self.shared.nodes.lock().unwrap();
+        let Some(node) = nodes.get(id) else { return };
+        let v = value as f32;
+        match node.kind {
+            Kind::Mixer => match param {
+                "master" => node.gain.store(v.to_bits(), Ordering::Relaxed),
+                "channel" => {
+                    if let Some(g) = node.mixer_gains.get(index as usize) {
+                        g.store(v.to_bits(), Ordering::Relaxed);
+                    }
+                }
+                _ => {}
+            },
+            _ => {
+                for slot in &node.dsp {
+                    slot.lock().unwrap().set_param(param, index as usize, v);
+                }
+            }
+        }
     }
 
-    pub fn disconnect(&self, source: &str, target: &str) {
-        self.shared
-            .edges
-            .lock()
-            .unwrap()
-            .retain(|(s, t)| !(s == source && t == target));
-        self.recompute_routes();
+    pub fn connect(&self, source: &str, src_ch: u32, target: &str, tgt_ch: u32) {
+        let mut edges = self.shared.edges.lock().unwrap();
+        let (src_ch, tgt_ch) = (src_ch as usize, tgt_ch as usize);
+        // Dedup so a replayed channel change doesn't double an edge.
+        if !edges
+            .iter()
+            .any(|e| e.src == source && e.tgt == target && e.src_ch == src_ch && e.tgt_ch == tgt_ch)
+        {
+            edges.push(Edge {
+                src: source.to_string(),
+                src_ch,
+                tgt: target.to_string(),
+                tgt_ch,
+            });
+        }
+        drop(edges);
+        self.recompute();
+    }
+
+    pub fn disconnect(&self, source: &str, src_ch: u32, target: &str, tgt_ch: u32) {
+        let (src_ch, tgt_ch) = (src_ch as usize, tgt_ch as usize);
+        self.shared.edges.lock().unwrap().retain(|e| {
+            !(e.src == source && e.tgt == target && e.src_ch == src_ch && e.tgt_ch == tgt_ch)
+        });
+        self.recompute();
     }
 
     pub fn destroy_node(&self, id: &str) {
@@ -256,65 +390,66 @@ impl Engine {
             .edges
             .lock()
             .unwrap()
-            .retain(|(s, t)| s != id && t != id);
+            .retain(|e| e.src != id && e.tgt != id);
         let _ = self.tx.send(Command::DropStream { id: id.to_string() });
-        self.recompute_routes();
+        self.recompute();
     }
 
-    /// Snapshot of every meter as `"<nodeId>:<index>" -> dB`.
+    /// Snapshot of every meter as `"<id>:<index>" -> dB`, plus per-channel
+    /// compressor gain reduction as `"<id>#gr<index>" -> dB`.
     pub fn meters(&self) -> HashMap<String, f64> {
         let nodes = self.shared.nodes.lock().unwrap();
-        let mut out = HashMap::with_capacity(nodes.len());
+        let mut out = HashMap::with_capacity(nodes.len() * 2);
         for (id, node) in nodes.iter() {
             for (i, m) in node.meters.iter().enumerate() {
                 out.insert(format!("{id}:{i}"), m.get() as f64);
+            }
+            for (i, r) in node.reduction.iter().enumerate() {
+                out.insert(format!("{id}#gr{i}"), r.get() as f64);
             }
         }
         out
     }
 
-    /// Trace each output back through the chain and publish its render plan.
-    fn recompute_routes(&self) {
+    /// Rebuild the published snapshot from the current nodes + edges. Resets all
+    /// meters so disconnected nodes read silence (active chains repopulate them
+    /// on the next audio block).
+    fn recompute(&self) {
         let nodes = self.shared.nodes.lock().unwrap();
         let edges = self.shared.edges.lock().unwrap();
-        for (out_id, out_node) in nodes.iter() {
-            let Some(route_swap) = &out_node.route else { continue };
-            let mut source = None;
-            let mut gain_nodes: Vec<Arc<NodeState>> = Vec::new();
-            let mut level_nodes: Vec<Arc<NodeState>> = Vec::new();
-            let mut cur = out_id.clone();
-            let mut seen = HashSet::new();
-            seen.insert(cur.clone());
-            loop {
-                // First edge feeding `cur` (fan-in takes the first source — slice limit).
-                let Some((src_id, _)) = edges.iter().find(|(_, t)| *t == cur).map(|e| (e.0.clone(), ())) else {
-                    break;
-                };
-                if !seen.insert(src_id.clone()) {
-                    break; // cycle guard
-                }
-                let Some(node) = nodes.get(&src_id) else { break };
-                match node.kind {
-                    Kind::Input => {
-                        source = Some(node.clone());
-                        break;
-                    }
-                    Kind::Volume => {
-                        gain_nodes.push(node.clone());
-                        level_nodes.push(node.clone());
-                        cur = src_id;
-                    }
-                    Kind::Output | Kind::Passthrough => {
-                        level_nodes.push(node.clone());
-                        cur = src_id;
-                    }
-                }
-            }
-            // The output's own gain applies, and its meter shows the final level.
-            gain_nodes.push(out_node.clone());
-            level_nodes.push(out_node.clone());
-            route_swap.store(Arc::new(Route { source, gain_nodes, level_nodes }));
+
+        for node in nodes.values() {
+            node.reset_meters();
         }
+
+        let mut incoming: HashMap<String, Vec<Edge>> = HashMap::new();
+        for e in edges.iter() {
+            // Skip edges whose endpoints/channels no longer exist.
+            let src_ok = nodes.get(&e.src).map(|n| e.src_ch < n.out_channels()).unwrap_or(false);
+            let tgt_ok = nodes.get(&e.tgt).map(|n| e.tgt_ch < n.in_channels()).unwrap_or(false);
+            if src_ok && tgt_ok {
+                incoming.entry(e.tgt.clone()).or_default().push(e.clone());
+            }
+        }
+
+        self.shared.snapshot.store(Arc::new(GraphSnapshot {
+            nodes: nodes.clone(),
+            incoming,
+        }));
+    }
+}
+
+impl NodeState {
+    /// Number of output handles (mixer collapses to one).
+    fn out_channels(&self) -> usize {
+        match self.kind {
+            Kind::Mixer => 1,
+            _ => self.channels.max(1),
+        }
+    }
+    /// Number of input handles.
+    fn in_channels(&self) -> usize {
+        self.channels.max(1)
     }
 }
 
@@ -324,11 +459,119 @@ impl Drop for Engine {
     }
 }
 
+// ── Graph evaluation (runs inside an output stream callback) ─────────────────
+
+/// Evaluate node `id`, output channel `ch`, into a fresh interleaved-stereo block
+/// of `frames * 2` samples. `cache` pops each input exactly once per block so a
+/// fan-out from one input within this output's graph stays correct.
+fn eval(
+    snap: &GraphSnapshot,
+    id: &str,
+    ch: usize,
+    frames: usize,
+    sr: f32,
+    cache: &mut HashMap<String, Vec<f32>>,
+    depth: u32,
+) -> Vec<f32> {
+    let n = frames * 2;
+    let Some(node) = snap.nodes.get(id) else {
+        return vec![0.0; n];
+    };
+    if depth > MAX_DEPTH {
+        return vec![0.0; n];
+    }
+
+    // Input node: pop the capture ring (once per block), apply input gain + meter.
+    if node.kind == Kind::Input {
+        if let Some(cached) = cache.get(id) {
+            return cached.clone();
+        }
+        let mut b = vec![0.0f32; n];
+        {
+            let mut guard = node.consumer.lock().unwrap();
+            if let Some(cons) = guard.as_mut() {
+                cons.pop_slice(&mut b);
+            }
+        }
+        let g = node.gain_lin();
+        if g != 1.0 {
+            for s in b.iter_mut() {
+                *s *= g;
+            }
+        }
+        if let Some(m) = node.meters.first() {
+            m.set(rms_to_db(rms(&b)));
+        }
+        cache.insert(id.to_string(), b.clone());
+        return b;
+    }
+
+    let empty: Vec<Edge> = Vec::new();
+    let incoming = snap.incoming.get(id).unwrap_or(&empty);
+
+    let mut acc = vec![0.0f32; n];
+
+    if node.kind == Kind::Mixer {
+        // Every input channel folds into the single output, each with its gain.
+        for e in incoming.iter() {
+            let up = eval(snap, &e.src, e.src_ch, frames, sr, cache, depth + 1);
+            let g = node
+                .mixer_gains
+                .get(e.tgt_ch)
+                .map(|a| f32::from_bits(a.load(Ordering::Relaxed)))
+                .unwrap_or(1.0);
+            for i in 0..n {
+                acc[i] += up[i] * g;
+            }
+        }
+        let m = node.gain_lin();
+        if m != 1.0 {
+            for s in acc.iter_mut() {
+                *s *= m;
+            }
+        }
+        if let Some(meter) = node.meters.first() {
+            meter.set(rms_to_db(rms(&acc)));
+        }
+        return acc;
+    }
+
+    // Sum every upstream feeding this output channel (Web Audio summing semantics).
+    for e in incoming.iter().filter(|e| e.tgt_ch == ch) {
+        let up = eval(snap, &e.src, e.src_ch, frames, sr, cache, depth + 1);
+        for i in 0..n {
+            acc[i] += up[i];
+        }
+    }
+
+    match node.kind {
+        Kind::Volume | Kind::Output => {
+            let g = node.gain_lin();
+            if g != 1.0 {
+                for s in acc.iter_mut() {
+                    *s *= g;
+                }
+            }
+        }
+        _ if node.kind.dsp_kind() => {
+            if let Some(slot) = node.dsp.get(ch) {
+                slot.lock().unwrap().process(&mut acc, sr);
+            }
+        }
+        _ => {} // passthrough
+    }
+
+    let mi = ch.min(node.meters.len().saturating_sub(1));
+    if let Some(meter) = node.meters.get(mi) {
+        meter.set(rms_to_db(rms(&acc)));
+    }
+    acc
+}
+
 // ── Audio thread: owns the cpal streams ──────────────────────────────────────
 
 fn audio_thread(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Command>) {
     let host = cpal::default_host();
-    // Streams live here for their whole lifetime and never move to another thread.
     let mut streams: HashMap<String, cpal::Stream> = HashMap::new();
 
     while let Ok(cmd) = rx.recv() {
@@ -398,7 +641,6 @@ fn build_input(
 
     let rb = HeapRb::<f32>::new(RING_FRAMES * 2);
     let (prod, cons) = rb.split();
-    // Hand the consumer to the node so output callbacks can read it.
     if let Some(node) = shared.nodes.lock().unwrap().get(node_id) {
         *node.consumer.lock().unwrap() = Some(cons);
     }
@@ -430,7 +672,6 @@ where
             stereo[2 * i] = l;
             stereo[2 * i + 1] = r;
         }
-        // Overrun (consumer behind) silently drops the excess — acceptable for a monitor.
         prod.push_slice(&stereo[..frames * 2]);
     }
 }
@@ -445,20 +686,20 @@ fn build_output(
     let supported = device.default_output_config().map_err(|e| e.to_string())?;
     let cfg: StreamConfig = supported.config();
     let out_ch = cfg.channels as usize;
-
-    let route = shared
-        .nodes
-        .lock()
-        .unwrap()
-        .get(node_id)
-        .and_then(|n| n.route.clone())
-        .ok_or("output node missing route")?;
+    let sr = cfg.sample_rate.0 as f32;
 
     let err = |e| eprintln!("[audio] output stream error: {e}");
+    let id = node_id.to_string();
     let stream = match supported.sample_format() {
-        SampleFormat::F32 => device.build_output_stream(&cfg, output_cb::<f32>(out_ch, route), err, None),
-        SampleFormat::I16 => device.build_output_stream(&cfg, output_cb::<i16>(out_ch, route), err, None),
-        SampleFormat::U16 => device.build_output_stream(&cfg, output_cb::<u16>(out_ch, route), err, None),
+        SampleFormat::F32 => {
+            device.build_output_stream(&cfg, output_cb::<f32>(out_ch, sr, shared.clone(), id), err, None)
+        }
+        SampleFormat::I16 => {
+            device.build_output_stream(&cfg, output_cb::<i16>(out_ch, sr, shared.clone(), id), err, None)
+        }
+        SampleFormat::U16 => {
+            device.build_output_stream(&cfg, output_cb::<u16>(out_ch, sr, shared.clone(), id), err, None)
+        }
         f => return Err(format!("unsupported output sample format: {f:?}")),
     }
     .map_err(|e| e.to_string())?;
@@ -467,17 +708,21 @@ fn build_output(
 
 fn output_cb<T>(
     out_ch: usize,
-    route: Arc<ArcSwap<Route>>,
+    sr: f32,
+    shared: Arc<Shared>,
+    node_id: String,
 ) -> impl FnMut(&mut [T], &OutputCallbackInfo)
 where
     T: SizedSample + FromSample<f32>,
 {
     let out_ch = out_ch.max(1);
-    let mut stereo = vec![0f32; MAX_BLOCK_FRAMES * 2];
+    let mut cache: HashMap<String, Vec<f32>> = HashMap::new();
     move |data: &mut [T], _| {
         let frames = (data.len() / out_ch).min(MAX_BLOCK_FRAMES);
-        let n = frames * 2;
-        render(&route, &mut stereo[..n]);
+        let snap = shared.snapshot.load();
+        cache.clear();
+        let stereo = eval(&snap, &node_id, 0, frames, sr, &mut cache, 0);
+
         for i in 0..frames {
             let l = stereo[2 * i];
             let r = stereo[2 * i + 1];
@@ -493,59 +738,4 @@ where
             }
         }
     }
-}
-
-/// Fill `stereo` (interleaved L/R) for one output block and update meters.
-fn render(route_swap: &ArcSwap<Route>, stereo: &mut [f32]) {
-    let route = route_swap.load();
-    for s in stereo.iter_mut() {
-        *s = 0.0;
-    }
-    let Some(source) = route.source.as_ref() else {
-        for node in &route.level_nodes {
-            node.set_all_meters(-72.0);
-        }
-        return;
-    };
-
-    // Pull captured audio from the input's ring buffer (zero-fill on underrun).
-    let got = {
-        let mut guard = source.consumer.lock().unwrap();
-        match guard.as_mut() {
-            Some(cons) => cons.pop_slice(stereo),
-            None => 0,
-        }
-    };
-    // Input gain → input meter (post-gain, matching the Web Audio engine).
-    let g_in = source.gain_lin();
-    if g_in != 1.0 {
-        for s in stereo[..got].iter_mut() {
-            *s *= g_in;
-        }
-    }
-    source.set_all_meters(rms_to_db(rms(&stereo[..got])));
-
-    // Cumulative gain of the chain (volumes + output).
-    let mut g = 1.0f32;
-    for node in &route.gain_nodes {
-        g *= node.gain_lin();
-    }
-    if g != 1.0 {
-        for s in stereo.iter_mut() {
-            *s *= g;
-        }
-    }
-
-    let out_db = rms_to_db(rms(stereo));
-    for node in &route.level_nodes {
-        node.set_all_meters(out_db);
-    }
-}
-
-fn rms(buf: &[f32]) -> f32 {
-    if buf.is_empty() {
-        return 0.0;
-    }
-    let sum: f32 = buf.iter().map(|s| s * s).sum();
-    (sum / buf.len() as f32).sqrt()
 }

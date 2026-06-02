@@ -137,13 +137,13 @@ impl NativeAudioEngine {
     }
 
     #[napi]
-    pub fn connect(&self, source: String, target: String) {
-        self.engine.connect(&source, &target);
+    pub fn connect(&self, source: String, source_channel: u32, target: String, target_channel: u32) {
+        self.engine.connect(&source, source_channel, &target, target_channel);
     }
 
     #[napi]
-    pub fn disconnect(&self, source: String, target: String) {
-        self.engine.disconnect(&source, &target);
+    pub fn disconnect(&self, source: String, source_channel: u32, target: String, target_channel: u32) {
+        self.engine.disconnect(&source, source_channel, &target, target_channel);
     }
 
     #[napi]
@@ -154,6 +154,13 @@ impl NativeAudioEngine {
     #[napi]
     pub fn set_muted(&self, id: String, muted: bool) {
         self.engine.set_muted(&id, muted);
+    }
+
+    /// Generic effect-parameter setter (see engine::Engine::set_param). `index`
+    /// selects an EQ band or mixer input channel; scalar params ignore it.
+    #[napi]
+    pub fn set_param(&self, id: String, param: String, index: u32, value: f64) {
+        self.engine.set_param(&id, &param, index, value);
     }
 
     #[napi]

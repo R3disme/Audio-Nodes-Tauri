@@ -45,12 +45,14 @@ const api = {
       ipcRenderer.send('audio:create-node', id, nodeType, channels, deviceId),
     setOutputDevice: (id: string, deviceId: string): void =>
       ipcRenderer.send('audio:set-output-device', id, deviceId),
-    connect: (source: string, target: string): void =>
-      ipcRenderer.send('audio:connect', source, target),
-    disconnect: (source: string, target: string): void =>
-      ipcRenderer.send('audio:disconnect', source, target),
+    connect: (source: string, sourceChannel: number, target: string, targetChannel: number): void =>
+      ipcRenderer.send('audio:connect', source, sourceChannel, target, targetChannel),
+    disconnect: (source: string, sourceChannel: number, target: string, targetChannel: number): void =>
+      ipcRenderer.send('audio:disconnect', source, sourceChannel, target, targetChannel),
     setGain: (id: string, gain: number): void => ipcRenderer.send('audio:set-gain', id, gain),
     setMuted: (id: string, muted: boolean): void => ipcRenderer.send('audio:set-muted', id, muted),
+    setParam: (id: string, param: string, index: number, value: number): void =>
+      ipcRenderer.send('audio:set-param', id, param, index, value),
     destroyNode: (id: string): void => ipcRenderer.send('audio:destroy-node', id),
     pollMeters: (): Promise<Record<string, number>> => ipcRenderer.invoke('audio:poll-meters')
   }
