@@ -29,25 +29,29 @@ export interface SavedGraph {
   counter: number
 }
 
+/** Build a plain serializable snapshot of the graph. */
+export function serializeGraph(nodes: AudioFlowNode[], edges: AudioFlowEdge[], counter: number): SavedGraph {
+  return {
+    nodes: nodes.map(n => ({
+      id: n.id,
+      type: n.type ?? 'unknown',
+      position: { x: n.position.x, y: n.position.y },
+      data: n.data as Record<string, unknown>
+    })),
+    edges: edges.map(e => ({
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      sourceHandle: e.sourceHandle,
+      targetHandle: e.targetHandle
+    })),
+    counter
+  }
+}
+
 export function saveGraph(nodes: AudioFlowNode[], edges: AudioFlowEdge[], counter: number): void {
   try {
-    const payload: SavedGraph = {
-      nodes: nodes.map(n => ({
-        id: n.id,
-        type: n.type ?? 'unknown',
-        position: { x: n.position.x, y: n.position.y },
-        data: n.data as Record<string, unknown>
-      })),
-      edges: edges.map(e => ({
-        id: e.id,
-        source: e.source,
-        target: e.target,
-        sourceHandle: e.sourceHandle,
-        targetHandle: e.targetHandle
-      })),
-      counter
-    }
-    localStorage.setItem(KEY, JSON.stringify(payload))
+    localStorage.setItem(KEY, JSON.stringify(serializeGraph(nodes, edges, counter)))
   } catch {
     /* storage unavailable / quota — non-fatal */
   }

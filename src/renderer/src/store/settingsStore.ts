@@ -50,6 +50,7 @@ interface SettingsState {
   setBackgroundOpacity: (v: number) => void
   setMode: (mode: ThemeMode) => void
   resetTheme: () => void
+  importSettings: (s: { theme?: unknown; sidebarCollapsed?: boolean; nodeScale?: number }) => void
 
   setSidebarCollapsed: (v: boolean) => void
   toggleSidebar: () => void
@@ -121,6 +122,21 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
 
     resetTheme: () => {
       commit(DEFAULT_THEME)
+      afterChange()
+    },
+
+    importSettings: (incoming) => {
+      const t = incoming.theme as Partial<Theme> | undefined
+      const theme: Theme = t
+        ? { ...DEFAULT_THEME, ...t, nodes: { ...DEFAULT_THEME.nodes, ...t.nodes } }
+        : get().theme
+      applyTheme(theme)
+      if (typeof incoming.nodeScale === 'number') applyNodeScale(incoming.nodeScale)
+      set({
+        theme,
+        sidebarCollapsed: typeof incoming.sidebarCollapsed === 'boolean' ? incoming.sidebarCollapsed : get().sidebarCollapsed,
+        nodeScale: typeof incoming.nodeScale === 'number' ? incoming.nodeScale : get().nodeScale
+      })
       afterChange()
     },
 

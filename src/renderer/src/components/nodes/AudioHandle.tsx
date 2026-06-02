@@ -20,7 +20,10 @@ interface AudioHandleProps {
  */
 export function AudioHandle({ type, id, nodeType, top = '50%', position }: AudioHandleProps): JSX.Element {
   const pos = position ?? (type === 'source' ? Position.Right : Position.Left)
-  const color = nodeColor(nodeType)
+  // Prefer the node-scoped accent (set by NodeBase, honors per-node overrides),
+  // falling back to the node type's themed color.
+  const color = `var(--node-accent, ${nodeColor(nodeType)})`
+  const colorDark = `var(--node-accent-dark, ${nodeColorDark(nodeType)})`
   return (
     <Handle
       type={type}
@@ -33,7 +36,7 @@ export function AudioHandle({ type, id, nodeType, top = '50%', position }: Audio
         // Radial highlight gives the socket a glossy, dimensional look without a
         // box-shadow (so the CSS hover glow stays free to animate).
         background: `radial-gradient(circle at 50% 30%, rgba(255,255,255,0.5), rgba(255,255,255,0) 55%), ${color}`,
-        border: `2px solid ${nodeColorDark(nodeType)}`,
+        border: `2px solid ${colorDark}`,
         top
       }}
     />

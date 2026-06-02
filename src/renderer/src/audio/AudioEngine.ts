@@ -113,6 +113,12 @@ interface ManagedNode {
   // For output: each output terminates in its own MediaStream + <audio> element
   // so it can be routed to an independent device via the element's setSinkId.
   outputSink?: HTMLAudioElement
+  outputDeviceId?: string
+
+  // For input device auto-recovery:
+  inputDeviceId?: string
+  inputActive?: boolean
+  inputReconnectTimer?: number
 }
 
 interface GateChannel {
@@ -293,8 +299,14 @@ class AudioEngine {
     source.connect(gain)
     gain.connect(analyser)
 
+    // When the device drops (unplugged / default switched), the track ends —
+    // schedule an auto-recovery attempt.
+    const track = stream.getAudioTracks()[0]
+    if (track) track.onended = () => this.scheduleInputReconnect(id)
+
     // If we're swapping device on an existing node, preserve downstream wiring
     if (existing) {
+      if (existing.inputReconnectTimer) { window.clearTimeout(existing.inputReconnectTimer); existing.inputReconnectTimer = undefined }
       // Carry the prior gain/mute onto the new gain node so a device swap
       // doesn't reset the level or un-mute.
       gain.gain.value = existing.muted ? 0 : (existing.userGain ?? 1)
@@ -308,6 +320,8 @@ class AudioEngine {
       existing.outputs = [analyser]
       existing.meters = [analyser]
       existing.gainRefs = [gain]
+      existing.inputDeviceId = deviceId
+      existing.inputActive = true
       this.notifyNodeSubs()
       return
     }
@@ -318,9 +332,46 @@ class AudioEngine {
       outputs: [analyser],
       meters: [analyser],
       gainRefs: [gain],
-      mediaStream: stream
+      mediaStream: stream,
+      inputDeviceId: deviceId,
+      inputActive: true
     })
     this.notifyNodeSubs()
+  }
+
+  /** Periodically retry an input whose device dropped, until it returns. */
+  private scheduleInputReconnect(id: string): void {
+    const node = this.nodes.get(id)
+    if (!node || node.type !== 'input') return
+    node.inputActive = false
+    this.notifyNodeSubs()
+    if (node.inputReconnectTimer) window.clearTimeout(node.inputReconnectTimer)
+    node.inputReconnectTimer = window.setTimeout(async () => {
+      const current = this.nodes.get(id)
+      if (!current || current.type !== 'input') return
+      try {
+        // If a specific device was chosen, only retry once it's present again.
+        if (current.inputDeviceId) {
+          const devices = await navigator.mediaDevices.enumerateDevices()
+          const present = devices.some(d => d.kind === 'audioinput' && d.deviceId === current.inputDeviceId)
+          if (!present) { this.scheduleInputReconnect(id); return }
+        }
+        await this.createInputNode(id, current.inputDeviceId)
+      } catch {
+        this.scheduleInputReconnect(id)
+      }
+    }, 3000)
+  }
+
+  /** Re-arm any inputs that are currently inactive (called on devicechange). */
+  async recoverInputs(): Promise<void> {
+    for (const [id, node] of this.nodes) {
+      if (node.type === 'input' && node.inputActive === false) this.scheduleInputReconnect(id)
+    }
+  }
+
+  isInputActive(id: string): boolean {
+    return this.nodes.get(id)?.inputActive ?? true
   }
 
   /** Rewire any active connections that pointed FROM oldOut to point FROM newOut. */
@@ -474,14 +525,36 @@ class AudioEngine {
   }
 
   async setOutputDevice(id: string, deviceId: string): Promise<void> {
-    const el = this.nodes.get(id)?.outputSink
-    if (!el) return
+    const node = this.nodes.get(id)
+    if (!node?.outputSink) return
+    node.outputDeviceId = deviceId
     try {
       // Empty string selects the system default device.
-      await el.setSinkId(deviceId || '')
+      await node.outputSink.setSinkId(deviceId || '')
     } catch (e) {
       console.warn('setSinkId failed:', e)
     }
+  }
+
+  /** Re-apply each output's chosen device + resume playback after a devicechange. */
+  async recoverOutputs(): Promise<void> {
+    for (const node of this.nodes.values()) {
+      const el = node.outputSink
+      if (!el) continue
+      try {
+        if (node.outputDeviceId) await el.setSinkId(node.outputDeviceId || '')
+        if (el.paused) await el.play()
+      } catch { /* device not ready yet — will retry on next devicechange */ }
+    }
+  }
+
+  /** Estimated input→output latency in ms (Web Audio context latencies). */
+  getLatencyMs(): number {
+    const ctx = this.ctx
+    if (!ctx) return 0
+    const base = ctx.baseLatency ?? 0
+    const out = (ctx as AudioContext & { outputLatency?: number }).outputLatency ?? 0
+    return Math.round((base + out) * 1000)
   }
 
   // ── Effect: Volume (multi-channel) ──────────────────────────────────────
@@ -1172,6 +1245,7 @@ class AudioEngine {
     // Stop any media streams
     node.mediaStream?.getTracks().forEach(t => t.stop())
     if (node.appReconnectTimer) window.clearTimeout(node.appReconnectTimer)
+    if (node.inputReconnectTimer) window.clearTimeout(node.inputReconnectTimer)
 
     // Stop and detach an output node's playback element so it doesn't keep
     // pulling from the (now-disconnected) audio graph.

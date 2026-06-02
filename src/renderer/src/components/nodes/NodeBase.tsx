@@ -1,7 +1,7 @@
 import { type ReactNode } from 'react'
 import { X, Plus, Minus } from 'lucide-react'
 import { useAudioStore } from '@renderer/store/audioStore'
-import { nodeColor } from '@renderer/lib/nodeColors'
+import { DEFAULT_NODE_COLORS, darken } from '@renderer/lib/nodeColors'
 
 const headerIcons: Record<string, string> = {
   input:       '🎙',
@@ -39,8 +39,17 @@ export function NodeBase({
   id, nodeType, label, children, width = 220, selected = false, channelControl
 }: NodeBaseProps): JSX.Element {
   const removeNode = useAudioStore(s => s.removeNode)
-  const headerColor = nodeColor(nodeType)
+  const setNodeColor = useAudioStore(s => s.setNodeColor)
+  const colorOverride = useAudioStore(
+    s => (s.nodes.find(n => n.id === id)?.data as { color?: string } | undefined)?.color
+  )
   const icon = headerIcons[nodeType] ?? '▪'
+
+  // Per-node accent: an override (if set) or the themed type color. Exposed as a
+  // scoped CSS var so the header and this node's sockets pick it up.
+  const accent = colorOverride || `var(--node-${nodeType}, ${DEFAULT_NODE_COLORS[nodeType] ?? '#52525b'})`
+  const accentDark = colorOverride ? darken(colorOverride) : `var(--node-${nodeType}-dark, ${darken(DEFAULT_NODE_COLORS[nodeType] ?? '#52525b')})`
+  const swatchValue = colorOverride || DEFAULT_NODE_COLORS[nodeType] || '#888888'
 
   const min = channelControl?.min ?? 1
   const max = channelControl?.max ?? 4
@@ -51,13 +60,20 @@ export function NodeBase({
         an-node-card rounded-lg overflow-hidden shadow-xl select-none transition-shadow
         ${selected ? 'ring-2 ring-[color:var(--c-accent)]' : 'ring-1 ring-black/60'}
       `}
-      style={{ width, background: 'linear-gradient(180deg, var(--c-surface-2) 0%, var(--c-surface-3) 100%)' }}
+      style={{
+        width,
+        minHeight: channelControl ? minHeightForChannels(channelControl.channels) : undefined,
+        background: 'linear-gradient(180deg, var(--c-surface-2) 0%, var(--c-surface-3) 100%)',
+        // Scoped accent — header + this node's sockets read these.
+        ['--node-accent' as string]: accent,
+        ['--node-accent-dark' as string]: accentDark
+      } as React.CSSProperties}
     >
       {/* Header — accent color with a glossy top sheen */}
       <div
         className="flex items-center justify-between px-2 py-1.5 cursor-move"
         style={{
-          background: `linear-gradient(180deg, rgba(255,255,255,0.18), rgba(0,0,0,0.22)), ${headerColor}`,
+          background: 'linear-gradient(180deg, rgba(255,255,255,0.18), rgba(0,0,0,0.22)), var(--node-accent)',
           boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.18), inset 0 -1px 0 rgba(0,0,0,0.35)'
         }}
       >
@@ -67,6 +83,21 @@ export function NodeBase({
         </div>
 
         <div className="flex items-center gap-1 shrink-0">
+          {/* Per-node color: click to recolor, right-click to reset to default */}
+          <label
+            className="relative w-3.5 h-3.5 rounded-full nodrag cursor-pointer ring-1 ring-black/40 hover:ring-white/40 transition-all shrink-0"
+            title="Recolor node (right-click to reset)"
+            style={{ background: swatchValue }}
+            onContextMenu={e => { e.preventDefault(); setNodeColor(id, null) }}
+          >
+            <input
+              type="color"
+              value={swatchValue}
+              onChange={e => setNodeColor(id, e.target.value)}
+              className="absolute inset-0 opacity-0 cursor-pointer"
+            />
+          </label>
+
           {channelControl && (
             <div className="flex items-center gap-0.5 nodrag" title="Number of audio channels">
               <button
@@ -189,7 +220,21 @@ export function MuteButton({ muted, onToggle, size = 'md' }: MuteButtonProps): J
   )
 }
 
-/** Helper: stack handle Y position evenly within a node. */
-export function handleY(index: number, total: number): string {
-  return `${((index + 0.5) / total) * 100}%`
+// Socket layout: a vertically-centered group with a *fixed pixel pitch*. A single
+// socket sits dead-center (so simple chains stay tidy); extra channels fan out
+// above/below at a constant spacing. Because the pitch is fixed (not a fraction
+// of node height), the same channel on two nodes lines up — wires run parallel
+// instead of criss-crossing the way height-fraction positioning did.
+export const HANDLE_PITCH = 22 // px between sockets
+
+/** CSS `top` for channel `index` of `total`, centered with fixed pitch. */
+export function handleY(index: number, total = 1): string {
+  if (total <= 1) return '50%'
+  const offset = (index - (total - 1) / 2) * HANDLE_PITCH
+  return `calc(50% + ${offset.toFixed(1)}px)`
+}
+
+/** Minimum node height needed to fit `channels` centered, evenly-pitched sockets. */
+export function minHeightForChannels(channels: number): number {
+  return (channels - 1) * HANDLE_PITCH + 84
 }

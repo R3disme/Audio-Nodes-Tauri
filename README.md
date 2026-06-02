@@ -88,6 +88,20 @@ Open the palette button in the toolbar to recolor the whole app:
   canvas background (with an opacity control).
 
 There's also a **node scale** slider, and the **add-node panel collapses** to a slim rail.
+Click the **color dot** in any node's header to recolor just that node (right-click to reset).
+
+## 🧩 Workflow
+
+- **Presets** (toolbar) — one-click starting graphs: Mic→Speakers, Podcast chain, Karaoke, Streaming mix.
+- **Export / Import** (toolbar) — save the whole config (graph + theme) to a `.json` file and load it back or share it.
+- **Guide** (toolbar `?`) — in-app help.
+- **Latency** — the toolbar shows the estimated input→output latency.
+- **Auto-recovery** — if an input device drops out (unplugged / default changed) the node reconnects when it returns, and outputs re-bind their device automatically.
+
+> **Virtual devices:** creating a real OS-level virtual input/output that other apps see
+> requires an audio **driver** — Windows doesn't let an app invent endpoints. Install
+> [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free); a **Virtual Output** node
+> then feeds that cable so other apps can capture your mix.
 
 ### Tips
 - Click a node in the sidebar to drop it on the canvas, or drag it where you want.

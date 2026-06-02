@@ -45,7 +45,7 @@ export function VirtualOutputNode({ id, data, selected }: NodeProps): JSX.Elemen
         onChange={setDevice}
       />
 
-      <div className="flex items-center justify-between gap-2 mb-2">
+      <div className="flex gap-2 mb-1.5">
         <div className="flex-1 min-w-0">
           <SliderRow
             label="Level"
@@ -55,15 +55,14 @@ export function VirtualOutputNode({ id, data, selected }: NodeProps): JSX.Elemen
             display={`${(d.volume * 100).toFixed(0)}%`}
             onChange={setVolume}
           />
+          <div className="flex items-center justify-between mt-1.5">
+            <MuteButton muted={d.muted} onToggle={toggleMute} />
+            <span className="text-[9px] truncate max-w-[100px]" style={{ color: 'var(--c-text-dim)' }} title={d.deviceName}>
+              {d.deviceName || 'Pick a cable…'}
+            </span>
+          </div>
         </div>
-        <StereoVUMeter nodeId={id} height={32} className="shrink-0" />
-      </div>
-
-      <div className="flex items-center justify-between mb-1.5">
-        <MuteButton muted={d.muted} onToggle={toggleMute} />
-        <span className="text-[9px] truncate max-w-[120px]" style={{ color: 'var(--c-text-dim)' }} title={d.deviceName}>
-          {d.deviceName || 'Pick a cable…'}
-        </span>
+        <StereoVUMeter nodeId={id} height={52} className="shrink-0" />
       </div>
 
       <div className="flex items-start gap-1.5 px-2 py-1 rounded"

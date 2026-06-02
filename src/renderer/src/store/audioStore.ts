@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { nodeColor } from '@renderer/lib/nodeColors'
-import { saveGraph, loadGraph as loadSavedGraph } from '@renderer/lib/graphPersistence'
+import { saveGraph, serializeGraph, loadGraph as loadSavedGraph, type SavedGraph } from '@renderer/lib/graphPersistence'
+import { useSettingsStore } from '@renderer/store/settingsStore'
 import {
   addEdge,
   applyNodeChanges,
@@ -239,6 +240,62 @@ async function rebuildEngineNode(type: string, id: string, data: Record<string, 
 
 // ── Store ─────────────────────────────────────────────────────────────────
 
+/** Edge stroke for a connection from `srcNode` — its per-node override or type color. */
+function edgeStrokeFor(srcNode?: { type?: string; data?: Record<string, unknown> }): string {
+  const override = srcNode?.data?.color
+  return typeof override === 'string' && override ? override : nodeColor(srcNode?.type)
+}
+
+/** Rebuild the engine + React Flow state from a serialized graph (replaces current). */
+async function applySavedGraph(saved: SavedGraph): Promise<void> {
+  const maxFromIds = saved.nodes.reduce((max, n) => {
+    const tail = parseInt(n.id.split('_').pop() ?? '0', 10)
+    return Number.isFinite(tail) ? Math.max(max, tail) : max
+  }, 0)
+  nodeCounter = Math.max(saved.counter ?? 0, maxFromIds, nodeCounter)
+
+  for (const n of saved.nodes) {
+    try {
+      await rebuildEngineNode(n.type, n.id, n.data)
+    } catch (e) {
+      console.warn('Failed to restore node', n.id, e)
+    }
+  }
+
+  const edges: AudioFlowEdge[] = []
+  for (const e of saved.edges) {
+    const src = parseHandle(e.sourceHandle)
+    const tgt = parseHandle(e.targetHandle)
+    const ok = audioEngine.connect(e.source, src?.channel ?? 0, e.target, tgt?.channel ?? 0)
+    if (!ok) continue
+    const srcNode = saved.nodes.find(n => n.id === e.source)
+    edges.push({
+      id: e.id, source: e.source, target: e.target,
+      sourceHandle: e.sourceHandle, targetHandle: e.targetHandle,
+      style: { stroke: edgeStrokeFor(srcNode), strokeWidth: 2 }
+    })
+  }
+
+  const nodes = saved.nodes.map(n => ({
+    id: n.id, type: n.type, position: n.position, data: n.data
+  })) as AudioFlowNode[]
+  useAudioStore.setState({ nodes, edges })
+}
+
+/** Destroy all engine nodes and empty the canvas. */
+function clearGraphInternal(): void {
+  for (const n of useAudioStore.getState().nodes) audioEngine.destroyNode(n.id)
+  useAudioStore.setState({ nodes: [], edges: [] })
+}
+
+export interface ExportedConfig {
+  version: number
+  graph: SavedGraph
+  theme: unknown
+  sidebarCollapsed: boolean
+  nodeScale: number
+}
+
 interface AudioStore {
   nodes: AudioFlowNode[]
   edges: AudioFlowEdge[]
@@ -253,9 +310,14 @@ interface AudioStore {
   removeNode: (id: string) => void
   updateNodeData: (id: string, data: Partial<AudioNodeData>) => void
   setNodeChannels: (id: string, type: AudioNodeType, channels: number) => void
+  setNodeColor: (id: string, color: string | null) => void
 
   initAudio: () => Promise<void>
   loadGraph: () => Promise<void>
+  clearGraph: () => void
+  loadPreset: (graph: SavedGraph) => Promise<void>
+  exportConfig: () => ExportedConfig
+  importConfig: (cfg: ExportedConfig) => Promise<void>
   refreshDevices: () => Promise<void>
 }
 
@@ -543,6 +605,19 @@ export const useAudioStore = create<AudioStore>((set, get) => ({
     })
   },
 
+  /** Override a single node's accent color (null clears it), recoloring its edges. */
+  setNodeColor: (id, color) => {
+    set(s => {
+      const nodes = s.nodes.map(n =>
+        n.id === id ? { ...n, data: { ...n.data, color: color ?? undefined } as AudioNodeData & Record<string, unknown> } : n
+      )
+      const srcNode = nodes.find(n => n.id === id)
+      const stroke = edgeStrokeFor(srcNode)
+      const edges = s.edges.map(e => (e.source === id ? { ...e, style: { ...e.style, stroke } } : e))
+      return { nodes, edges }
+    })
+  },
+
   // ── Audio initialization ───────────────────────────────────────────────
 
   initAudio: async () => {
@@ -561,9 +636,11 @@ export const useAudioStore = create<AudioStore>((set, get) => ({
       useAudioStore.subscribe(() => scheduleSave())
     }
 
-    // Update devices when they change (e.g. plug/unplug)
+    // Update devices when they change (e.g. plug/unplug) and auto-recover I/O.
     navigator.mediaDevices.addEventListener('devicechange', () => {
       get().refreshDevices().catch(console.error)
+      audioEngine.recoverInputs().catch(console.error)
+      audioEngine.recoverOutputs().catch(console.error)
     })
   },
 
@@ -573,42 +650,41 @@ export const useAudioStore = create<AudioStore>((set, get) => ({
     graphLoaded = true
     const saved = loadSavedGraph()
     if (!saved || saved.nodes.length === 0) return
+    await applySavedGraph(saved)
+  },
 
-    // Continue id numbering past the restored nodes to avoid collisions.
-    const maxFromIds = saved.nodes.reduce((max, n) => {
-      const tail = parseInt(n.id.split('_').pop() ?? '0', 10)
-      return Number.isFinite(tail) ? Math.max(max, tail) : max
-    }, 0)
-    nodeCounter = Math.max(saved.counter ?? 0, maxFromIds)
+  clearGraph: () => {
+    clearGraphInternal()
+    scheduleSave()
+  },
 
-    // Recreate engine nodes first…
-    for (const n of saved.nodes) {
-      try {
-        await rebuildEngineNode(n.type, n.id, n.data)
-      } catch (e) {
-        console.warn('Failed to restore node', n.id, e)
-      }
+  loadPreset: async (graph) => {
+    clearGraphInternal()
+    await applySavedGraph(graph)
+    scheduleSave()
+  },
+
+  exportConfig: () => {
+    const { nodes, edges } = get()
+    const s = useSettingsStore.getState()
+    return {
+      version: 1,
+      graph: serializeGraph(nodes, edges, nodeCounter),
+      theme: s.theme,
+      sidebarCollapsed: s.sidebarCollapsed,
+      nodeScale: s.nodeScale
     }
+  },
 
-    // …then reconnect the edges that are still valid.
-    const edges: AudioFlowEdge[] = []
-    for (const e of saved.edges) {
-      const src = parseHandle(e.sourceHandle)
-      const tgt = parseHandle(e.targetHandle)
-      const ok = audioEngine.connect(e.source, src?.channel ?? 0, e.target, tgt?.channel ?? 0)
-      if (!ok) continue
-      const srcType = saved.nodes.find(n => n.id === e.source)?.type
-      edges.push({
-        id: e.id, source: e.source, target: e.target,
-        sourceHandle: e.sourceHandle, targetHandle: e.targetHandle,
-        style: { stroke: nodeColor(srcType), strokeWidth: 2 }
-      })
-    }
-
-    const nodes = saved.nodes.map(n => ({
-      id: n.id, type: n.type, position: n.position, data: n.data
-    })) as AudioFlowNode[]
-    set({ nodes, edges })
+  importConfig: async (cfg) => {
+    clearGraphInternal()
+    if (cfg?.graph?.nodes) await applySavedGraph(cfg.graph)
+    useSettingsStore.getState().importSettings({
+      theme: cfg?.theme,
+      sidebarCollapsed: cfg?.sidebarCollapsed,
+      nodeScale: cfg?.nodeScale
+    })
+    scheduleSave()
   },
 
   refreshDevices: async () => {
