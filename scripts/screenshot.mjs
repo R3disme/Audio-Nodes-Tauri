@@ -10,7 +10,7 @@ mkdirSync(SHOT_DIR, { recursive: true });
 const app = await electron.launch({
   executablePath: join(ROOT, 'node_modules/electron/dist/electron.exe'),
   args: [join(ROOT, 'out/main/index.js')],
-  env: { ...process.env, NODE_ENV: 'production' },
+  env: { ...process.env, NODE_ENV: 'production', AUDIO_NODES_E2E: '1' },
   timeout: 30_000,
 });
 
@@ -25,7 +25,10 @@ page.on('pageerror', err => console.log('[page error]', err.message));
 // Deterministic run: clear any persisted graph/settings, then reload fresh.
 await page.evaluate(() => {
   localStorage.removeItem('audio-nodes.graph.v1');
-  localStorage.removeItem('audio-nodes.settings.v1');
+  localStorage.removeItem('audio-nodes.workspaces.v1');
+  // Pin the Web Audio engine so the demo is deterministic, independent of the
+  // app's default engine.
+  localStorage.setItem('audio-nodes.settings.v1', JSON.stringify({ engine: 'webaudio' }));
 });
 await page.reload();
 await new Promise(r => setTimeout(r, 1500));
@@ -48,7 +51,8 @@ const layout = await page.evaluate(async () => {
     delay:       { x: 1080, y: 300 },
     pan:         { x: 1080, y:  70 },
     mixer:       { x: 820, y: 540 },
-    output:      { x: 1100, y: 540 }
+    output:      { x: 1100, y: 540 },
+    recorder:    { x: 1100, y: 760 }
   };
   for (const [type, pos] of Object.entries(positions)) {
     await store.getState().addNode(type, pos);
@@ -89,10 +93,25 @@ const layout = await page.evaluate(async () => {
   connect(ids.pan, 'out-0', ids.mixer, 'in-3');
 
   connect(ids.mixer, 'out-0', ids.output, 'in-0');
+  connect(ids.mixer, 'out-0', ids.recorder, 'in-0');
 
   return { ok: true, nodeCount: store.getState().nodes.length, edgeCount: store.getState().edges.length };
 });
 console.log('Layout result:', layout);
+
+// Add two more workspaces (one disabled) so the workspace bar shows several
+// tables, then return to the first for the screenshot.
+await page.evaluate(async () => {
+  const store = window.__audioStore;
+  store.getState().addWorkspace();
+  store.getState().renameWorkspace(store.getState().activeWorkspaceId, 'Stream Mix');
+  store.getState().addWorkspace();
+  store.getState().renameWorkspace(store.getState().activeWorkspaceId, 'Podcast');
+  await store.getState().setWorkspaceEnabled(store.getState().activeWorkspaceId, false);
+  store.getState().setActiveWorkspace(store.getState().workspaces[0].id);
+  store.getState().renameWorkspace(store.getState().workspaces[0].id, 'Main');
+});
+await new Promise(r => setTimeout(r, 300));
 
 await new Promise(r => setTimeout(r, 800));
 

@@ -218,6 +218,10 @@ struct Shared {
     nodes: Mutex<HashMap<String, Arc<NodeState>>>,
     edges: Mutex<Vec<Edge>>,
     snapshot: ArcSwap<GraphSnapshot>,
+    // Live device buffer sizes (frames) + sample rate, for the latency estimate.
+    in_frames: AtomicU32,
+    out_frames: AtomicU32,
+    sr: AtomicU32,
 }
 
 pub struct Engine {
@@ -231,6 +235,9 @@ impl Engine {
             nodes: Mutex::new(HashMap::new()),
             edges: Mutex::new(Vec::new()),
             snapshot: ArcSwap::from_pointee(GraphSnapshot::empty()),
+            in_frames: AtomicU32::new(0),
+            out_frames: AtomicU32::new(0),
+            sr: AtomicU32::new(0),
         });
         let (tx, rx) = channel::<Command>();
         let thread_shared = shared.clone();
@@ -302,6 +309,19 @@ impl Engine {
             _ => {}
         }
         self.recompute();
+    }
+
+    /// Rough input→output latency estimate (ms) from the live device buffer
+    /// sizes. 0 until streams are running. (Shared-mode WASAPI is typically a few
+    /// tens of ms; this is an estimate, not a guarantee.)
+    pub fn latency_ms(&self) -> f64 {
+        let sr = self.shared.sr.load(Ordering::Relaxed);
+        if sr == 0 {
+            return 0.0;
+        }
+        let frames = self.shared.in_frames.load(Ordering::Relaxed)
+            + self.shared.out_frames.load(Ordering::Relaxed);
+        (frames as f64 / sr as f64 * 1000.0).round()
     }
 
     pub fn set_input_device(&self, id: &str, device_id: &str) {
@@ -647,16 +667,16 @@ fn build_input(
 
     let err = |e| eprintln!("[audio] input stream error: {e}");
     let stream = match supported.sample_format() {
-        SampleFormat::F32 => device.build_input_stream(&cfg, input_cb::<f32>(in_ch, prod), err, None),
-        SampleFormat::I16 => device.build_input_stream(&cfg, input_cb::<i16>(in_ch, prod), err, None),
-        SampleFormat::U16 => device.build_input_stream(&cfg, input_cb::<u16>(in_ch, prod), err, None),
+        SampleFormat::F32 => device.build_input_stream(&cfg, input_cb::<f32>(in_ch, prod, shared.clone()), err, None),
+        SampleFormat::I16 => device.build_input_stream(&cfg, input_cb::<i16>(in_ch, prod, shared.clone()), err, None),
+        SampleFormat::U16 => device.build_input_stream(&cfg, input_cb::<u16>(in_ch, prod, shared.clone()), err, None),
         f => return Err(format!("unsupported input sample format: {f:?}")),
     }
     .map_err(|e| e.to_string())?;
     Ok(stream)
 }
 
-fn input_cb<T>(in_ch: usize, mut prod: HeapProd<f32>) -> impl FnMut(&[T], &cpal::InputCallbackInfo)
+fn input_cb<T>(in_ch: usize, mut prod: HeapProd<f32>, shared: Arc<Shared>) -> impl FnMut(&[T], &cpal::InputCallbackInfo)
 where
     T: SizedSample,
     f32: FromSample<T>,
@@ -665,6 +685,7 @@ where
     let mut stereo = vec![0f32; MAX_BLOCK_FRAMES * 2];
     move |data: &[T], _| {
         let frames = (data.len() / in_ch).min(MAX_BLOCK_FRAMES);
+        shared.in_frames.store(frames as u32, Ordering::Relaxed);
         for i in 0..frames {
             let base = i * in_ch;
             let l = f32::from_sample(data[base]);
@@ -719,6 +740,8 @@ where
     let mut cache: HashMap<String, Vec<f32>> = HashMap::new();
     move |data: &mut [T], _| {
         let frames = (data.len() / out_ch).min(MAX_BLOCK_FRAMES);
+        shared.out_frames.store(frames as u32, Ordering::Relaxed);
+        shared.sr.store(sr as u32, Ordering::Relaxed);
         let snap = shared.snapshot.load();
         cache.clear();
         let stereo = eval(&snap, &node_id, 0, frames, sr, &mut cache, 0);

@@ -48,6 +48,7 @@ interface Window {
       setParam: (id: string, param: string, index: number, value: number) => void
       destroyNode: (id: string) => void
       pollMeters: () => Promise<Record<string, number>>
+      latency: () => Promise<number>
     }
   }
 }

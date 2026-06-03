@@ -7,7 +7,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const app = await electron.launch({
   executablePath: join(ROOT, 'node_modules/electron/dist/electron.exe'),
   args: [join(ROOT, 'out/main/index.js')],
-  env: { ...process.env, NODE_ENV: 'production' },
+  env: { ...process.env, NODE_ENV: 'production', AUDIO_NODES_E2E: '1' },
   timeout: 30_000,
 });
 
@@ -26,15 +26,18 @@ page.on('pageerror', err => errors.push(`Page error: ${err.message}`));
 // Deterministic run: clear any persisted graph/settings, then reload fresh.
 await page.evaluate(() => {
   localStorage.removeItem('audio-nodes.graph.v1');
-  localStorage.removeItem('audio-nodes.settings.v1');
+  localStorage.removeItem('audio-nodes.workspaces.v1');
+  // Pin the Web Audio engine so the check is deterministic + full-featured,
+  // independent of the app's default engine.
+  localStorage.setItem('audio-nodes.settings.v1', JSON.stringify({ engine: 'webaudio' }));
 });
 await page.reload();
 await new Promise(r => setTimeout(r, 1500));
 
 // Add all node types
 const types = [
-  'input', 'application', 'volume', 'eq', 'compressor', 'gate',
-  'reverb', 'delay', 'chorus', 'distortion', 'pan', 'mixer', 'output'
+  'input', 'fileplayer', 'application', 'volume', 'eq', 'compressor', 'gate',
+  'reverb', 'delay', 'chorus', 'distortion', 'pan', 'mixer', 'output', 'recorder'
 ];
 for (const t of types) {
   await page.evaluate(type => window.__audioStore.getState().addNode(type), t);
@@ -70,6 +73,23 @@ await page.evaluate(() => {
   e.setDistortion(byType('distortion').id, { drive: 20, mix: 0.7 });
   e.setPan(byType('pan').id, -0.8);
 });
+
+// Workspaces: create a second table, add nodes, disable (teardown) → edit
+// visual-only → re-enable (rebuild), then switch back. Exercises the
+// build/teardown + disabled-edit paths.
+await page.evaluate(async () => {
+  const store = window.__audioStore;
+  store.getState().addWorkspace();
+  await store.getState().addNode('input');
+  await store.getState().addNode('output');
+  const wsId = store.getState().activeWorkspaceId;
+  await store.getState().setWorkspaceEnabled(wsId, false);
+  await store.getState().addNode('volume');   // visual-only add while disabled
+  store.getState().setNodeChannels(store.getState().nodes.find(n => n.type === 'volume').id, 'volume', 2); // visual-only channel change
+  await store.getState().setWorkspaceEnabled(wsId, true);
+  store.getState().setActiveWorkspace(store.getState().workspaces[0].id);
+});
+await new Promise(r => setTimeout(r, 400));
 
 // Delete all nodes
 await page.evaluate(() => {

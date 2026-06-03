@@ -2,6 +2,7 @@ import { ReactFlowProvider } from '@xyflow/react'
 import { Toolbar } from './components/Toolbar'
 import { Sidebar } from './components/Sidebar'
 import { NodeEditor } from './components/NodeEditor'
+import { WorkspaceBar } from './components/WorkspaceBar'
 import { ThemePanel } from './components/ThemePanel'
 
 export function App(): JSX.Element {
@@ -10,9 +11,15 @@ export function App(): JSX.Element {
       <Toolbar />
       <div className="flex flex-1 overflow-hidden">
         <Sidebar />
-        <ReactFlowProvider>
-          <NodeEditor />
-        </ReactFlowProvider>
+        {/* Right column: workspace tabs above the canvas. */}
+        <div className="flex flex-col flex-1 min-w-0">
+          <WorkspaceBar />
+          <div className="flex-1 min-h-0 relative">
+            <ReactFlowProvider>
+              <NodeEditor />
+            </ReactFlowProvider>
+          </div>
+        </div>
       </div>
       <ThemePanel />
     </div>

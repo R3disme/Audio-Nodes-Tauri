@@ -1,8 +1,9 @@
 # 🎛 Audio Nodes
 
-A node-based audio mixer for Windows — a fully customizable, Blender-style alternative
-to the Windows volume mixer and tools like Voicemeeter. Wire **inputs** (mics, line-in,
-per-app/window capture) through **effects** into **outputs**, all on a visual canvas.
+A node-based audio router & mixer for Windows — a fully customizable, Blender-style
+alternative to the Windows volume mixer and tools like Voicemeeter. Wire **inputs**
+(mics, line-in, virtual cables, per-app/window capture) through **effects** into
+**outputs**, all on a visual canvas.
 
 ![Wired graph](screenshots/wired.png)
 
@@ -11,7 +12,7 @@ per-app/window capture) through **effects** into **outputs**, all on a visual ca
 **Double-click `start.bat`.**
 
 On the first run it installs everything it needs and then opens the app; after that it
-just launches. That's it — you don't need to touch a terminal.
+just launches. You don't need to touch a terminal.
 
 > Prefer PowerShell? Right-click `start.ps1` → **Run with PowerShell**.
 
@@ -31,110 +32,119 @@ npm start     # opens the app (hot-reload dev build)
 ## ✅ Requirements
 
 - **[Node.js](https://nodejs.org) 18+** (LTS recommended) — bundles `npm`.
-- **Windows 10/11** — application/window capture and `setSinkId` output routing are
-  Windows-focused (the app runs on other platforms, but those features may not).
-- *(Optional)* **[VB-Audio Virtual Cable](https://vb-audio.com/Cable/)** or similar — only
-  needed for the **Virtual Output** node and true per-app input isolation.
+- **Windows 10/11** — window capture, `setSinkId` output routing and the virtual-cable
+  driver are Windows-focused (the app runs elsewhere, but those features may not).
 
-No global tooling is required; everything is installed locally via `npm install`.
-
-## 📦 Dependencies
-
-Installed automatically by `npm install`. Pinned versions live in `package.json` /
-`package-lock.json`.
-
-**Runtime**
-
-| Package | Purpose |
-| --- | --- |
-| `react`, `react-dom` | UI |
-| `@xyflow/react` | Node-graph canvas |
-| `zustand` | State management (graph + settings) |
-| `lucide-react` | Icons |
-| `@electron-toolkit/preload`, `@electron-toolkit/utils` | Electron helpers |
-| `playwright-core` | Drives the app for the e2e screenshot/error scripts |
-
-**Dev / build**
-
-| Package | Purpose |
-| --- | --- |
-| `electron`, `electron-vite` | Desktop shell + bundler |
-| `typescript` | Type checking |
-| `@vitejs/plugin-react` | React fast refresh |
-| `tailwindcss`, `postcss`, `autoprefixer` | Styling |
-| `@types/*` | Type definitions |
+No global tooling is required for the default build; everything installs via `npm install`.
 
 ## 🎚 What's inside
 
-- **Sources** — Input (mic / line-in), Application (capture a window's audio)
+- **Sources** — Input (mic / line-in), **File Player** (play a local audio file),
+  Application (capture a window's audio)
 - **Effects** — Volume, 5-band Equalizer, Compressor, Gate, Pan
 - **Creative / FX** — Reverb, Delay/Echo, Chorus, Distortion (great for vocals & karaoke)
-- **Mixing / Out** — 4-channel Mixer, **Output** (physical monitor device),
-  **Virtual Output** (route the mix to a virtual cable so other apps can use it)
+- **Mixing / Out** — 4-channel Mixer, **Output** (physical device),
+  **Virtual Output** (route the mix into a virtual cable), **Recorder** (capture to a file)
 
-Effect nodes are **multi-channel** (1–8 independent signal paths via the +/- in the node
-header). Sockets and connection lines are **color-coded by node type** so signal flow is
-easy to trace. Your graph (nodes, positions, parameters, connections) is **saved
-automatically** and restored next launch.
+Effect nodes are **multi-channel** (1–8 independent signal paths via the −/+ in the node
+header — channel 0 never bleeds into channel 1). Sockets and wires are **color-coded by
+node type** so signal flow is easy to trace.
+
+## 🗂 Workspaces (tables)
+
+The tabs above the canvas are **independent node graphs**. Each has its own **enable/disable
+toggle**, so several can run **in parallel** (keep one routing while you build another), or
+sit disabled and silent. Rename, add, delete, and bulk **All on / All off**. Everything is
+saved automatically and restored next launch.
+
+## 🪟 Runs in the system tray
+
+Audio Nodes is a background audio router: **minimize or close** and it drops to the **system
+tray**, still routing audio while the UI and meters pause (so it barely uses any resources).
+Click the tray icon to bring it back; **Quit** from the tray menu to fully exit.
+
+## 🔌 Routing to / from other apps (virtual cable)
+
+A real OS-level virtual device needs a **driver** — Windows won't let an app invent endpoints.
+Audio Nodes ships its own, the **Audio Nodes Virtual Cable** (a virtual *speaker* + *mic*
+pair), built from source in [`native/driver/`](native/driver/README.md). Or use
+[VB-Audio Virtual Cable](https://vb-audio.com/Cable/).
+
+- **Send your mix out:** a **Virtual Output** node plays into the cable (Playback); pick the
+  cable (Recording) as the microphone in Discord / OBS / a game.
+- **Pull audio in:** set another app's speaker to the cable (Playback); add an **Input**
+  node on the cable (Recording) to bring that audio into your graph.
+
+> Building the driver needs Visual Studio 2022 + the Windows Driver Kit, and (for your own
+> machine) test signing. See [`native/driver/README.md`](native/driver/README.md). It's a
+> rebrand of the MIT [`VirtualDrivers/Virtual-Audio-Driver`](https://github.com/VirtualDrivers/Virtual-Audio-Driver),
+> vendored as a git submodule — run `git submodule update --init --recursive` after cloning.
+
+## ⚡ Engines: Native (Rust) & Web Audio
+
+Audio Nodes runs on a **native Rust audio engine** (`native/audio-engine/`) by **default**, for
+lower overhead and real device-latency reporting. The **Web Audio** engine is the fully-featured
+fallback — switch between them anytime in the Theme panel.
+
+```bash
+npm run build:native     # compile the Rust addon (needs the Rust toolchain)
+```
+
+- If the addon **isn't built**, the app **transparently uses Web Audio** for that session — so
+  `start.bat` always has sound; build the addon to unlock the native engine.
+- A few features are **Web Audio-only** for now and are clearly disabled on native: the
+  **File Player**, **recording to a file**, and **application capture**. The native engine also
+  expects input/output at the same sample rate (e.g. 48 kHz). These are being ported.
 
 ## 🎨 Theming
 
-Open the palette button in the toolbar to recolor the whole app:
+Open the palette button in the toolbar:
 
-- **Simple** — pick one accent color; the background, panels, text and a distinct node
-  palette are auto-derived.
+- **Simple** — pick one accent color; background, panels, text and a node palette are derived.
 - **Advanced** — fine-tune every interface token and each node color.
-- **Picture** — generate a palette from an image, and optionally show that image as the
-  canvas background (with an opacity control).
+- **Picture** — generate a palette from an image (optionally shown as the canvas background).
 
-There's also a **node scale** slider, and the **add-node panel collapses** to a slim rail.
-Click the **color dot** in any node's header to recolor just that node (right-click to reset).
+There's also a **node-scale** slider, a collapsible add-node rail, and per-node recolor (click
+the color dot in a node header; right-click to reset).
 
 ## 🧩 Workflow
 
-- **Presets** (toolbar) — one-click starting graphs: Mic→Speakers, Podcast chain, Karaoke, Streaming mix.
-- **Export / Import** (toolbar) — save the whole config (graph + theme) to a `.json` file and load it back or share it.
-- **Guide** (toolbar `?`) — in-app help.
-- **Latency** — the toolbar shows the estimated input→output latency.
-- **Auto-recovery** — if an input device drops out (unplugged / default changed) the node reconnects when it returns, and outputs re-bind their device automatically.
-
-> **Virtual devices:** creating a real OS-level virtual input/output that other apps see
-> requires an audio **driver** — Windows doesn't let an app invent endpoints. Install
-> [VB-Audio Virtual Cable](https://vb-audio.com/Cable/) (free); a **Virtual Output** node
-> then feeds that cable so other apps can capture your mix.
-
-### Tips
-- Click a node in the sidebar to drop it on the canvas, or drag it where you want.
-- Drag from an **output** socket (right) to an **input** socket (left) to connect.
-- Select a node/edge and press **Delete** to remove it.
-- For true **per-application isolation**, route the app through a virtual audio cable
-  (e.g. VB-Audio Virtual Cable) and pick it as an **Input** device — Windows loopback
-  capture otherwise grabs all system audio.
+- **Presets** (toolbar) — one-click starting graphs: Mic→Speakers, Podcast, Karaoke, Streaming.
+- **Export / Import** (toolbar) — save the whole config (all workspaces + theme) to a `.json`.
+- **Guide** (toolbar `?`) — an in-app visual walkthrough.
+- **Latency** — the toolbar shows estimated input→output latency.
+- **Auto-recovery** — dropped input devices reconnect when they return; outputs re-bind their device.
 
 ## 🧪 End-to-end checks
 
 ```bash
 npm run build
-node scripts/check-errors.mjs   # builds every node type, asserts no console errors
+node scripts/check-errors.mjs   # adds every node type, asserts no console errors/warnings
 node scripts/screenshot.mjs     # wires a demo graph, writes screenshots/
 ```
 
 ## 🛠 Stack
 
-Electron + electron-vite · React 18 + TypeScript (strict) · @xyflow/react (canvas) ·
-Zustand · Web Audio API · Tailwind CSS
+Electron + electron-vite · React 18 + TypeScript (strict) · @xyflow/react (canvas) · Zustand ·
+Web Audio API · Tailwind CSS · (optional) Rust + napi-rs engine · (optional) WDM/PortCls driver
 
 ## 📁 Project layout
 
 ```
 src/
-  main/        Electron main process (window, desktopCapturer, display-media handler)
+  main/        Electron main process (window, tray, desktopCapturer, native-engine IPC)
   preload/     Context-isolated IPC bridge
-  renderer/
-    src/
-      audio/        AudioEngine — the Web Audio graph + effects
-      components/   Toolbar, Sidebar, NodeEditor, ThemePanel, VU meters, nodes/
-      lib/          color/theme math, node colors, persistence
-      store/        Zustand stores (audio graph, settings/theme)
+  renderer/src/
+    audio/        AudioEngine (Web Audio) + NativeEngine (Rust IPC) behind an AudioBackend seam
+    components/   Toolbar, Sidebar, WorkspaceBar, NodeEditor, ThemePanel, VU meters, nodes/
+    lib/          color/theme math, node colors, persistence
+    store/        Zustand stores (audio graph + workspaces, settings/theme)
+native/
+  audio-engine/  Rust napi-rs audio engine (beta; build with npm run build:native)
+  driver/        Audio Nodes Virtual Cable — fork+rebrand of an MIT virtual audio driver
 scripts/         Playwright e2e (screenshot + error check)
 ```
+
+## 📄 License
+
+[MIT](LICENSE). The vendored driver under `native/driver/vendor/` is MIT (see its `LICENSE`).

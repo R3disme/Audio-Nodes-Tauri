@@ -1,8 +1,39 @@
-import { app, shell, BrowserWindow, ipcMain, desktopCapturer, session } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, desktopCapturer, session, Tray, Menu, nativeImage } from 'electron'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
+import { TRAY_ICON_DATA_URL } from './trayIcon'
 
 let pendingCaptureSourceId: string | null = null
+
+// ── Tray / background ───────────────────────────────────────────────────────
+// The app is a background audio router: minimize and close both hide it to the
+// system tray (it keeps routing audio); it only really quits via the tray menu.
+let mainWindow: BrowserWindow | null = null
+let tray: Tray | null = null
+let appIcon: Electron.NativeImage | null = null
+let isQuitting = false
+// e2e harness (scripts/*.mjs) drives close/quit itself — don't trap close to the
+// tray or create a tray icon, so Playwright's app.close() exits cleanly.
+const E2E = process.env.AUDIO_NODES_E2E === '1'
+
+function showMainWindow(): void {
+  if (!mainWindow) { createWindow(); return }
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function createTray(): void {
+  if (tray || !appIcon) return
+  tray = new Tray(appIcon)
+  tray.setToolTip('Audio Nodes')
+  tray.setContextMenu(Menu.buildFromTemplate([
+    { label: 'Show Audio Nodes', click: () => showMainWindow() },
+    { type: 'separator' },
+    { label: 'Quit', click: () => { isQuitting = true; app.quit() } }
+  ]))
+  tray.on('click', () => showMainWindow())
+}
 
 // ── Native audio engine (Rust) bridge ──────────────────────────────────────
 //
@@ -33,6 +64,7 @@ interface NativeAudioEngineInstance {
   setParam(id: string, param: string, index: number, value: number): void
   destroyNode(id: string): void
   meters(): Record<string, number>
+  latencyMs(): number
 }
 interface NativeAudioModule {
   version(): string
@@ -69,7 +101,7 @@ async function getNativeEngine(): Promise<NativeAudioEngineInstance | null> {
 }
 
 function createWindow(): void {
-  const mainWindow = new BrowserWindow({
+  const win = new BrowserWindow({
     width: 1400,
     height: 900,
     minWidth: 900,
@@ -78,6 +110,7 @@ function createWindow(): void {
     autoHideMenuBar: true,
     backgroundColor: '#1a1a1a',
     frame: false,
+    icon: appIcon ?? undefined,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -85,35 +118,51 @@ function createWindow(): void {
       contextIsolation: true,
       // Output nodes play through <audio> elements; allow them to start without
       // a user gesture so audio routing works immediately on launch.
-      autoplayPolicy: 'no-user-gesture-required'
+      autoplayPolicy: 'no-user-gesture-required',
+      // Keep audio-thread work (e.g. the noise-gate detection loop) responsive
+      // while hidden in the tray. The renderer pauses its own meter work on
+      // visibilitychange, so this doesn't cost idle CPU.
+      backgroundThrottling: false
+    }
+  })
+  mainWindow = win
+
+  win.on('ready-to-show', () => {
+    win.show()
+  })
+
+  // Close + minimize hide to the tray instead of quitting / going to the taskbar,
+  // so the app keeps routing audio in the background. Real quit sets isQuitting.
+  win.on('close', (e) => {
+    if (!isQuitting && !E2E) {
+      e.preventDefault()
+      win.hide()
     }
   })
 
-  mainWindow.on('ready-to-show', () => {
-    mainWindow.show()
-  })
-
-  mainWindow.webContents.setWindowOpenHandler((details) => {
+  win.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
     return { action: 'deny' }
   })
 
   if (is.dev && process.env['ELECTRON_RENDERER_URL']) {
-    mainWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
+    win.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
-    mainWindow.loadFile(join(__dirname, '../renderer/index.html'))
+    win.loadFile(join(__dirname, '../renderer/index.html'))
   }
 }
 
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.audionodes')
+  appIcon = nativeImage.createFromDataURL(TRAY_ICON_DATA_URL)
+  app.on('before-quit', () => { isQuitting = true })
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
   })
 
-  // Window controls (frameless titlebar)
-  ipcMain.on('window-minimize', (e) => BrowserWindow.fromWebContents(e.sender)?.minimize())
+  // Window controls (frameless titlebar). Minimize hides to the tray.
+  ipcMain.on('window-minimize', (e) => BrowserWindow.fromWebContents(e.sender)?.hide())
   ipcMain.on('window-maximize', (e) => {
     const w = BrowserWindow.fromWebContents(e.sender)
     if (w?.isMaximized()) w.unmaximize()
@@ -172,6 +221,10 @@ app.whenReady().then(() => {
     const engine = await getNativeEngine()
     return engine ? engine.meters() : {}
   })
+  ipcMain.handle('audio:latency', async () => {
+    const engine = await getNativeEngine()
+    return engine ? engine.latencyMs() : 0
+  })
 
   // Graph control — one-way; resolve the engine then apply.
   const withEngine = (fn: (e: NativeAudioEngineInstance) => void): void => {
@@ -211,12 +264,16 @@ app.whenReady().then(() => {
   }, { useSystemPicker: false })
 
   createWindow()
+  if (!E2E) createTray()
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    else showMainWindow()
   })
 })
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') app.quit()
+  // Windows are hidden (not closed) when sent to the tray, so this normally only
+  // fires on a real quit. Keep the app alive otherwise.
+  if (process.platform !== 'darwin' && isQuitting) app.quit()
 })

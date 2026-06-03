@@ -17,7 +17,7 @@ interface PersistedSettings {
   theme: Theme
   sidebarCollapsed: boolean
   nodeScale: number
-  /** Which audio backend to use. 'webaudio' is the default during the migration. */
+  /** Which audio backend to use. Defaults to 'native' (faster); Web Audio is the fallback. */
   engine: EngineKind
 }
 
@@ -30,11 +30,11 @@ function load(): PersistedSettings {
         theme: { ...DEFAULT_THEME, ...p.theme, nodes: { ...DEFAULT_THEME.nodes, ...p.theme?.nodes } },
         sidebarCollapsed: p.sidebarCollapsed ?? false,
         nodeScale: p.nodeScale ?? 1,
-        engine: p.engine === 'native' ? 'native' : 'webaudio'
+        engine: p.engine === 'webaudio' ? 'webaudio' : 'native'
       }
     }
   } catch { /* ignore corrupt settings */ }
-  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1, engine: 'webaudio' }
+  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1, engine: 'native' }
 }
 
 const applyNodeScale = (n: number): void =>

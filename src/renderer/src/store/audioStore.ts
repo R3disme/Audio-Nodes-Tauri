@@ -1,6 +1,15 @@
 import { create } from 'zustand'
 import { nodeColor } from '@renderer/lib/nodeColors'
-import { saveGraph, serializeGraph, loadGraph as loadSavedGraph, type SavedGraph } from '@renderer/lib/graphPersistence'
+import {
+  serializeNodes,
+  serializeEdges,
+  saveWorkspaces,
+  loadWorkspaces,
+  type SavedGraph,
+  type SavedNode,
+  type SavedEdge,
+  type SavedWorkspace
+} from '@renderer/lib/graphPersistence'
 import { useSettingsStore } from '@renderer/store/settingsStore'
 import {
   addEdge,
@@ -24,7 +33,7 @@ import {
   type EQBand,
   type AudioNodeType
 } from '@renderer/audio/AudioEngine'
-import { audioEngine } from '@renderer/audio/backend'
+import { audioEngine, ensureBackendAvailable } from '@renderer/audio/backend'
 
 // ── Node data types ───────────────────────────────────────────────────────
 
@@ -108,6 +117,17 @@ export interface PanNodeData extends BaseNodeData {
   pan: number
 }
 
+// Recording is transient engine state (not persisted); the node data carries only
+// the common fields.
+export type RecorderNodeData = BaseNodeData
+
+export interface FilePlayerNodeData extends BaseNodeData {
+  fileName: string
+  loop: boolean
+  gain: number
+  muted: boolean
+}
+
 export type AudioNodeData =
   | InputNodeData
   | ApplicationNodeData
@@ -122,9 +142,20 @@ export type AudioNodeData =
   | ChorusNodeData
   | DistortionNodeData
   | PanNodeData
+  | RecorderNodeData
+  | FilePlayerNodeData
 
 export type AudioFlowNode = Node<AudioNodeData & Record<string, unknown>>
 export type AudioFlowEdge = Edge
+
+/** One workspace ("table"): a named, independently-enabled graph. */
+export interface Workspace {
+  id: string
+  name: string
+  enabled: boolean
+  nodes: AudioFlowNode[]
+  edges: AudioFlowEdge[]
+}
 
 // ── Handle ID encoding ────────────────────────────────────────────────────
 //
@@ -142,11 +173,78 @@ function parseHandle(handle: string | null | undefined): { kind: 'in' | 'out'; c
 
 let nodeCounter = 0
 const nextId = (prefix: string): string => `${prefix}_${++nodeCounter}`
+const genWorkspaceId = (): string => `ws_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+
+/** Highest numeric suffix among a set of node ids (for restoring the counter). */
+function maxIdTail(ids: string[]): number {
+  return ids.reduce((max, id) => {
+    const tail = parseInt(id.split('_').pop() ?? '0', 10)
+    return Number.isFinite(tail) ? Math.max(max, tail) : max
+  }, 0)
+}
 
 const centerOffset = (): XYPosition => ({
   x: 220 + Math.random() * 320,
   y: 80 + Math.random() * 240
 })
+
+// ── Default node data factory ───────────────────────────────────────────────
+//
+// One place that produces the initial data + id prefix for every node type, so
+// `addNode` stays tiny and engine rebuilds (which read the same `data`) never
+// drift from creation defaults.
+
+interface NodeSpec { idPrefix: string; data: AudioNodeData & Record<string, unknown> }
+
+function makeNodeSpec(type: string): NodeSpec | null {
+  switch (type) {
+    case 'input':
+      return { idPrefix: 'input', data: { label: 'Input', deviceId: '', deviceName: 'Default', gain: 1, muted: false, channels: 1 } }
+    case 'fileplayer':
+      return { idPrefix: 'file', data: { label: 'File Player', fileName: '', loop: false, gain: 1, muted: false, channels: 1 } }
+    case 'application':
+      return { idPrefix: 'app', data: { label: 'Application', sourceId: '', sourceName: '', channels: 1 } }
+    case 'output':
+      return { idPrefix: 'output', data: { label: 'Output', deviceId: '', deviceName: 'Default', volume: 1, muted: false, channels: 1 } }
+    case 'virtual':
+      return { idPrefix: 'virtual', data: { label: 'Virtual Output', deviceId: '', deviceName: 'Default', volume: 1, muted: false, channels: 1 } }
+    case 'recorder':
+      return { idPrefix: 'rec', data: { label: 'Recorder', channels: 1 } }
+    case 'volume':
+      return { idPrefix: 'volume', data: { label: 'Volume', gain: 1, muted: false, channels: 1 } }
+    case 'eq':
+      return { idPrefix: 'eq', data: { label: 'Equalizer', bands: structuredClone(DEFAULT_EQ_BANDS), channels: 1 } }
+    case 'compressor':
+      return { idPrefix: 'comp', data: { label: 'Compressor', threshold: -24, knee: 6, ratio: 4, attack: 0.003, release: 0.25, channels: 1 } }
+    case 'gate':
+      return { idPrefix: 'gate', data: { label: 'Gate', threshold: -50, attack: 0.005, release: 0.1, channels: 1 } }
+    case 'reverb':
+      return { idPrefix: 'reverb', data: { label: 'Reverb', ...DEFAULT_REVERB, channels: 1 } }
+    case 'delay':
+      return { idPrefix: 'delay', data: { label: 'Delay', ...DEFAULT_DELAY, channels: 1 } }
+    case 'chorus':
+      return { idPrefix: 'chorus', data: { label: 'Chorus', ...DEFAULT_CHORUS, channels: 1 } }
+    case 'distortion':
+      return { idPrefix: 'dist', data: { label: 'Distortion', ...DEFAULT_DISTORTION, channels: 1 } }
+    case 'pan':
+      return { idPrefix: 'pan', data: { label: 'Pan', ...DEFAULT_PAN, channels: 1 } }
+    case 'mixer': {
+      const channelCount = 4
+      return {
+        idPrefix: 'mixer',
+        data: {
+          label: 'Mixer',
+          channelCount,
+          channels: channelCount,
+          masterGain: 1,
+          channels_state: Array.from({ length: channelCount }, (_, i) => ({ gain: 1, muted: false, label: `Ch ${i + 1}` }))
+        }
+      }
+    }
+    default:
+      return null
+  }
+}
 
 // ── Persistence wiring ──────────────────────────────────────────────────────
 
@@ -154,12 +252,23 @@ let graphLoaded = false
 let autosaveBound = false
 let saveTimer: number | undefined
 
-/** Debounced save of the current graph (positions, params, connections). */
+/** Snapshot the active workspace's live nodes/edges back into the workspaces array. */
+function flushActive(s: { workspaces: Workspace[]; activeWorkspaceId: string; nodes: AudioFlowNode[]; edges: AudioFlowEdge[] }): Workspace[] {
+  return s.workspaces.map(w =>
+    w.id === s.activeWorkspaceId ? { ...w, nodes: s.nodes, edges: s.edges } : w
+  )
+}
+
+/** Debounced save of all workspaces (positions, params, connections, enabled). */
 function scheduleSave(): void {
   if (saveTimer) window.clearTimeout(saveTimer)
   saveTimer = window.setTimeout(() => {
-    const { nodes, edges } = useAudioStore.getState()
-    saveGraph(nodes, edges, nodeCounter)
+    const s = useAudioStore.getState()
+    const workspaces: SavedWorkspace[] = flushActive(s).map(w => ({
+      id: w.id, name: w.name, enabled: w.enabled,
+      nodes: serializeNodes(w.nodes), edges: serializeEdges(w.edges)
+    }))
+    saveWorkspaces({ workspaces, activeId: s.activeWorkspaceId, counter: nodeCounter })
   }, 500)
 }
 
@@ -172,6 +281,14 @@ async function rebuildEngineNode(type: string, id: string, data: Record<string, 
       await audioEngine.createInputNode(id, (data.deviceId as string) || undefined)
       audioEngine.setGain(id, num(data.gain, 1))
       if (data.muted) audioEngine.muteNode(id, true)
+      break
+    case 'fileplayer':
+      // The picked file is a transient blob URL, so it isn't restored here — the
+      // node is recreated empty; the user re-loads a file. Gain/mute/loop persist.
+      audioEngine.createFilePlayerNode(id)
+      audioEngine.setGain(id, num(data.gain, 1))
+      if (data.muted) audioEngine.muteNode(id, true)
+      if (data.loop) audioEngine.setFilePlayerLoop(id, true)
       break
     case 'application':
       await audioEngine.createApplicationNode(id, '', (data.sourceName as string) || '')
@@ -186,6 +303,9 @@ async function rebuildEngineNode(type: string, id: string, data: Record<string, 
       audioEngine.setGain(id, num(data.volume, 1))
       if (data.muted) audioEngine.muteNode(id, true)
       if (data.deviceId) await audioEngine.setOutputDevice(id, data.deviceId as string)
+      break
+    case 'recorder':
+      audioEngine.createRecorderNode(id)
       break
     case 'volume':
       audioEngine.createVolumeNode(id, ch)
@@ -246,51 +366,71 @@ function edgeStrokeFor(srcNode?: { type?: string; data?: Record<string, unknown>
   return typeof override === 'string' && override ? override : nodeColor(srcNode?.type)
 }
 
-/** Rebuild the engine + React Flow state from a serialized graph (replaces current). */
-async function applySavedGraph(saved: SavedGraph): Promise<void> {
-  const maxFromIds = saved.nodes.reduce((max, n) => {
-    const tail = parseInt(n.id.split('_').pop() ?? '0', 10)
-    return Number.isFinite(tail) ? Math.max(max, tail) : max
-  }, 0)
-  nodeCounter = Math.max(saved.counter ?? 0, maxFromIds, nodeCounter)
-
-  for (const n of saved.nodes) {
-    try {
-      await rebuildEngineNode(n.type, n.id, n.data)
-    } catch (e) {
-      console.warn('Failed to restore node', n.id, e)
-    }
-  }
-
-  const edges: AudioFlowEdge[] = []
-  for (const e of saved.edges) {
-    const src = parseHandle(e.sourceHandle)
-    const tgt = parseHandle(e.targetHandle)
-    const ok = audioEngine.connect(e.source, src?.channel ?? 0, e.target, tgt?.channel ?? 0)
-    if (!ok) continue
-    const srcNode = saved.nodes.find(n => n.id === e.source)
-    edges.push({
+/** Rehydrate plain saved nodes/edges into React Flow objects (no engine work). */
+function deserializeGraph(savedNodes: SavedNode[], savedEdges: SavedEdge[]): { nodes: AudioFlowNode[]; edges: AudioFlowEdge[] } {
+  const nodes = savedNodes.map(n => ({
+    id: n.id, type: n.type, position: n.position, data: n.data
+  })) as AudioFlowNode[]
+  const edges = savedEdges.map(e => {
+    const srcNode = savedNodes.find(n => n.id === e.source)
+    return {
       id: e.id, source: e.source, target: e.target,
       sourceHandle: e.sourceHandle, targetHandle: e.targetHandle,
       style: { stroke: edgeStrokeFor(srcNode), strokeWidth: 2 }
-    })
-  }
-
-  const nodes = saved.nodes.map(n => ({
-    id: n.id, type: n.type, position: n.position, data: n.data
-  })) as AudioFlowNode[]
-  useAudioStore.setState({ nodes, edges })
+    }
+  }) as AudioFlowEdge[]
+  return { nodes, edges }
 }
 
-/** Destroy all engine nodes and empty the canvas. */
-function clearGraphInternal(): void {
-  for (const n of useAudioStore.getState().nodes) audioEngine.destroyNode(n.id)
-  useAudioStore.setState({ nodes: [], edges: [] })
+function materializeWorkspace(w: SavedWorkspace): Workspace {
+  const { nodes, edges } = deserializeGraph(w.nodes, w.edges)
+  return { id: w.id, name: w.name, enabled: w.enabled, nodes, edges }
+}
+
+/** Build engine nodes + connections for a graph (used when a workspace activates). */
+async function buildEngine(nodes: AudioFlowNode[], edges: AudioFlowEdge[]): Promise<void> {
+  for (const n of nodes) {
+    try {
+      await rebuildEngineNode(n.type ?? '', n.id, n.data as Record<string, unknown>)
+    } catch (e) {
+      console.warn('Failed to build node', n.id, e)
+    }
+  }
+  for (const e of edges) {
+    const src = parseHandle(e.sourceHandle)
+    const tgt = parseHandle(e.targetHandle)
+    audioEngine.connect(e.source, src?.channel ?? 0, e.target, tgt?.channel ?? 0)
+  }
+}
+
+/** Destroy engine nodes for a graph (used when a workspace deactivates). */
+function teardownEngine(nodes: AudioFlowNode[]): void {
+  for (const n of nodes) audioEngine.destroyNode(n.id)
+}
+
+/** Tear down every currently-enabled workspace's engine graph. */
+function teardownAllEngines(): void {
+  const s = useAudioStore.getState()
+  for (const w of s.workspaces) {
+    if (!w.enabled) continue
+    teardownEngine(w.id === s.activeWorkspaceId ? s.nodes : w.nodes)
+  }
+}
+
+/** Build engines for the enabled workspaces, then publish them to the store. */
+async function applyWorkspaces(workspaces: Workspace[], activeId: string): Promise<void> {
+  for (const w of workspaces) if (w.enabled) await buildEngine(w.nodes, w.edges)
+  const active = workspaces.find(w => w.id === activeId) ?? workspaces[0]
+  useAudioStore.setState({ workspaces, activeWorkspaceId: active.id, nodes: active.nodes, edges: active.edges })
 }
 
 export interface ExportedConfig {
   version: number
-  graph: SavedGraph
+  workspaces?: SavedWorkspace[]
+  activeWorkspaceId?: string
+  counter?: number
+  /** Legacy single-graph payload (older exports) — imported into one workspace. */
+  graph?: SavedGraph
   theme: unknown
   sidebarCollapsed: boolean
   nodeScale: number
@@ -299,6 +439,8 @@ export interface ExportedConfig {
 interface AudioStore {
   nodes: AudioFlowNode[]
   edges: AudioFlowEdge[]
+  workspaces: Workspace[]
+  activeWorkspaceId: string
   devices: { inputs: MediaDeviceInfo[]; outputs: MediaDeviceInfo[] }
   initialized: boolean
 
@@ -312,6 +454,14 @@ interface AudioStore {
   setNodeChannels: (id: string, type: AudioNodeType, channels: number) => void
   setNodeColor: (id: string, color: string | null) => void
 
+  // ── Workspaces ──
+  addWorkspace: () => void
+  removeWorkspace: (id: string) => void
+  renameWorkspace: (id: string, name: string) => void
+  setActiveWorkspace: (id: string) => void
+  setWorkspaceEnabled: (id: string, enabled: boolean) => Promise<void>
+  setAllWorkspacesEnabled: (enabled: boolean) => Promise<void>
+
   initAudio: () => Promise<void>
   loadGraph: () => Promise<void>
   clearGraph: () => void
@@ -321,374 +471,359 @@ interface AudioStore {
   refreshDevices: () => Promise<void>
 }
 
-export const useAudioStore = create<AudioStore>((set, get) => ({
-  nodes: [],
-  edges: [],
-  devices: { inputs: [], outputs: [] },
-  initialized: false,
+export const useAudioStore = create<AudioStore>((set, get) => {
+  /** Whether the active workspace's audio graph is live (engine calls apply). */
+  const activeEnabled = (): boolean => {
+    const s = get()
+    return s.workspaces.find(w => w.id === s.activeWorkspaceId)?.enabled ?? true
+  }
 
-  // ── React Flow change handlers ───────────────────────────────────────────
+  return {
+    nodes: [],
+    edges: [],
+    workspaces: [],
+    activeWorkspaceId: '',
+    devices: { inputs: [], outputs: [] },
+    initialized: false,
 
-  onNodesChange: (changes) => {
-    changes.forEach(c => {
-      if (c.type === 'remove') audioEngine.destroyNode(c.id)
-    })
-    set(s => ({ nodes: applyNodeChanges(changes, s.nodes) as AudioFlowNode[] }))
-  },
+    // ── React Flow change handlers ───────────────────────────────────────────
 
-  onEdgesChange: (changes) => {
-    changes.forEach(c => {
-      if (c.type === 'remove') {
-        const edge = get().edges.find(e => e.id === c.id)
-        if (edge?.source && edge?.target) {
-          const src = parseHandle(edge.sourceHandle)
-          const tgt = parseHandle(edge.targetHandle)
-          audioEngine.disconnect(
-            edge.source, src?.channel ?? 0,
-            edge.target, tgt?.channel ?? 0
-          )
-        }
-      }
-    })
-    set(s => ({ edges: applyEdgeChanges(changes, s.edges) }))
-  },
+    onNodesChange: (changes) => {
+      changes.forEach(c => {
+        if (c.type === 'remove') audioEngine.destroyNode(c.id)
+      })
+      set(s => ({ nodes: applyNodeChanges(changes, s.nodes) as AudioFlowNode[] }))
+    },
 
-  onConnect: (connection: Connection) => {
-    if (!connection.source || !connection.target) return
-    // Reject self-connections — they would form an audio feedback loop.
-    if (connection.source === connection.target) return
-    const src = parseHandle(connection.sourceHandle)
-    const tgt = parseHandle(connection.targetHandle)
-
-    // Validate: only out → in
-    if (src && src.kind !== 'out') return
-    if (tgt && tgt.kind !== 'in') return
-
-    const srcCh = src?.channel ?? 0
-    const tgtCh = tgt?.channel ?? 0
-
-    const ok = audioEngine.connect(connection.source, srcCh, connection.target, tgtCh)
-    if (!ok) return
-
-    // Blender-style: draw the edge in the source node's accent color.
-    const sourceType = get().nodes.find(n => n.id === connection.source)?.type
-    const stroke = nodeColor(sourceType)
-
-    set(s => ({
-      edges: addEdge(
-        {
-          ...connection,
-          id: `${connection.source}:${srcCh}->${connection.target}:${tgtCh}`,
-          style: { stroke, strokeWidth: 2 }
-        },
-        s.edges
-      )
-    }))
-  },
-
-  // ── Node creation ────────────────────────────────────────────────────────
-
-  addNode: async (type, position) => {
-    const pos = position ?? centerOffset()
-
-    switch (type) {
-      case 'input': {
-        const id = nextId('input')
-        await audioEngine.createInputNode(id)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'input', position: pos,
-            data: { label: 'Input', deviceId: '', deviceName: 'Default', gain: 1, muted: false, channels: 1 } as InputNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'application': {
-        const id = nextId('app')
-        // We start the node empty — the user picks a source from the AppPicker
-        // which then calls back into createApplicationNode. So just register
-        // a placeholder pass-through here.
-        await audioEngine.createApplicationNode(id, '', '')
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'application', position: pos,
-            data: { label: 'Application', sourceId: '', sourceName: '', channels: 1 } as ApplicationNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'output': {
-        const id = nextId('output')
-        audioEngine.createOutputNode(id, 'output')
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'output', position: pos,
-            data: { label: 'Output', deviceId: '', deviceName: 'Default', volume: 1, muted: false, channels: 1 } as OutputNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'virtual': {
-        const id = nextId('virtual')
-        audioEngine.createOutputNode(id, 'virtual')
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'virtual', position: pos,
-            data: { label: 'Virtual Output', deviceId: '', deviceName: 'Default', volume: 1, muted: false, channels: 1 } as OutputNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'volume': {
-        const id = nextId('volume')
-        audioEngine.createVolumeNode(id, 1)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'volume', position: pos,
-            data: { label: 'Volume', gain: 1, muted: false, channels: 1 } as VolumeNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'eq': {
-        const id = nextId('eq')
-        audioEngine.createEQNode(id, 1)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'eq', position: pos,
-            data: { label: 'Equalizer', bands: structuredClone(DEFAULT_EQ_BANDS), channels: 1 } as EQNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'compressor': {
-        const id = nextId('comp')
-        audioEngine.createCompressorNode(id, 1)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'compressor', position: pos,
-            data: { label: 'Compressor', threshold: -24, knee: 6, ratio: 4, attack: 0.003, release: 0.25, channels: 1 } as CompressorNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'gate': {
-        const id = nextId('gate')
-        audioEngine.createGateNode(id, 1)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'gate', position: pos,
-            data: { label: 'Gate', threshold: -50, attack: 0.005, release: 0.1, channels: 1 } as GateNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'reverb': {
-        const id = nextId('reverb')
-        audioEngine.createReverbNode(id, 1, DEFAULT_REVERB)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'reverb', position: pos,
-            data: { label: 'Reverb', ...DEFAULT_REVERB, channels: 1 } as ReverbNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'delay': {
-        const id = nextId('delay')
-        audioEngine.createDelayNode(id, 1, DEFAULT_DELAY)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'delay', position: pos,
-            data: { label: 'Delay', ...DEFAULT_DELAY, channels: 1 } as DelayNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'chorus': {
-        const id = nextId('chorus')
-        audioEngine.createChorusNode(id, 1, DEFAULT_CHORUS)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'chorus', position: pos,
-            data: { label: 'Chorus', ...DEFAULT_CHORUS, channels: 1 } as ChorusNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'distortion': {
-        const id = nextId('dist')
-        audioEngine.createDistortionNode(id, 1, DEFAULT_DISTORTION)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'distortion', position: pos,
-            data: { label: 'Distortion', ...DEFAULT_DISTORTION, channels: 1 } as DistortionNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'pan': {
-        const id = nextId('pan')
-        audioEngine.createPanNode(id, 1, DEFAULT_PAN)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'pan', position: pos,
-            data: { label: 'Pan', ...DEFAULT_PAN, channels: 1 } as PanNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-      case 'mixer': {
-        const id = nextId('mixer')
-        const channelCount = 4
-        audioEngine.createMixerNode(id, channelCount)
-        set(s => ({
-          nodes: [...s.nodes, {
-            id, type: 'mixer', position: pos,
-            data: {
-              label: 'Mixer',
-              channelCount,
-              channels: channelCount,
-              masterGain: 1,
-              channels_state: Array.from({ length: channelCount }, (_, i) => ({
-                gain: 1, muted: false, label: `Ch ${i + 1}`
-              }))
-            } as MixerNodeData
-          } as AudioFlowNode]
-        }))
-        break
-      }
-    }
-  },
-
-  removeNode: (id) => {
-    audioEngine.destroyNode(id)
-    set(s => ({
-      nodes: s.nodes.filter(n => n.id !== id),
-      edges: s.edges.filter(e => e.source !== id && e.target !== id)
-    }))
-  },
-
-  updateNodeData: (id, data) => {
-    set(s => ({
-      nodes: s.nodes.map(n =>
-        n.id === id ? { ...n, data: { ...n.data, ...data } as AudioNodeData & Record<string, unknown> } : n
-      )
-    }))
-  },
-
-  /**
-   * Change a node's channel count. Removes edges whose channel index no longer
-   * exists. Type-specific recreation is delegated to the audio engine.
-   */
-  setNodeChannels: (id, type, channels) => {
-    channels = Math.max(1, Math.min(8, Math.round(channels)))
-    const lostEdges = audioEngine.getConnectionsBeyondChannel(id, channels)
-    const actualChannels = audioEngine.setChannelCount(id, type, channels)
-
-    set(s => {
-      const nodes = s.nodes.map(n =>
-        n.id === id ? { ...n, data: { ...n.data, channels: actualChannels } } : n
-      )
-      const edges = s.edges.filter(e => {
-        // Drop edges that hit channels beyond the new count
-        for (const lost of lostEdges) {
-          if (e.source === lost.source && e.target === lost.target &&
-              e.sourceHandle === `out-${lost.sourceChannel}` &&
-              e.targetHandle === `in-${lost.targetChannel}`) {
-            return false
+    onEdgesChange: (changes) => {
+      changes.forEach(c => {
+        if (c.type === 'remove') {
+          const edge = get().edges.find(e => e.id === c.id)
+          if (edge?.source && edge?.target) {
+            const src = parseHandle(edge.sourceHandle)
+            const tgt = parseHandle(edge.targetHandle)
+            audioEngine.disconnect(
+              edge.source, src?.channel ?? 0,
+              edge.target, tgt?.channel ?? 0
+            )
           }
         }
-        return true
       })
-      return { nodes, edges }
-    })
-  },
+      set(s => ({ edges: applyEdgeChanges(changes, s.edges) }))
+    },
 
-  /** Override a single node's accent color (null clears it), recoloring its edges. */
-  setNodeColor: (id, color) => {
-    set(s => {
-      const nodes = s.nodes.map(n =>
-        n.id === id ? { ...n, data: { ...n.data, color: color ?? undefined } as AudioNodeData & Record<string, unknown> } : n
-      )
-      const srcNode = nodes.find(n => n.id === id)
-      const stroke = edgeStrokeFor(srcNode)
-      const edges = s.edges.map(e => (e.source === id ? { ...e, style: { ...e.style, stroke } } : e))
-      return { nodes, edges }
-    })
-  },
+    onConnect: (connection: Connection) => {
+      if (!connection.source || !connection.target) return
+      // Reject self-connections — they would form an audio feedback loop.
+      if (connection.source === connection.target) return
+      const src = parseHandle(connection.sourceHandle)
+      const tgt = parseHandle(connection.targetHandle)
 
-  // ── Audio initialization ───────────────────────────────────────────────
+      // Validate: only out → in
+      if (src && src.kind !== 'out') return
+      if (tgt && tgt.kind !== 'in') return
 
-  initAudio: async () => {
-    await audioEngine.init()
-    const devices = await audioEngine.getDevices()
-    set({ devices })
+      const srcCh = src?.channel ?? 0
+      const tgtCh = tgt?.channel ?? 0
 
-    // Restore the saved graph (positions, params, connections) before marking
-    // ready, so the canvas appears already wired.
-    await get().loadGraph()
-    set({ initialized: true })
+      // When the active workspace is disabled it has no live engine graph, so we
+      // only record the visual edge; it wires up when the workspace is enabled.
+      if (activeEnabled()) {
+        const ok = audioEngine.connect(connection.source, srcCh, connection.target, tgtCh)
+        if (!ok) return
+      }
 
-    // Autosave the graph on any change (debounced). Bound once.
-    if (!autosaveBound) {
-      autosaveBound = true
-      useAudioStore.subscribe(() => scheduleSave())
+      // Blender-style: draw the edge in the source node's accent color.
+      const sourceType = get().nodes.find(n => n.id === connection.source)?.type
+      const stroke = nodeColor(sourceType)
+
+      set(s => ({
+        edges: addEdge(
+          {
+            ...connection,
+            id: `${connection.source}:${srcCh}->${connection.target}:${tgtCh}`,
+            style: { stroke, strokeWidth: 2 }
+          },
+          s.edges
+        )
+      }))
+    },
+
+    // ── Node creation ────────────────────────────────────────────────────────
+
+    addNode: async (type, position) => {
+      const spec = makeNodeSpec(type)
+      if (!spec) return
+      const id = nextId(spec.idPrefix)
+      const pos = position ?? centerOffset()
+
+      // Only touch the engine when the active workspace is live; a disabled
+      // workspace stays visual-only until it is enabled.
+      if (activeEnabled()) {
+        try {
+          await rebuildEngineNode(type, id, spec.data as Record<string, unknown>)
+        } catch (e) {
+          console.warn('addNode: engine build failed', id, e)
+        }
+      }
+
+      set(s => ({
+        nodes: [...s.nodes, { id, type, position: pos, data: spec.data } as AudioFlowNode]
+      }))
+    },
+
+    removeNode: (id) => {
+      audioEngine.destroyNode(id)
+      set(s => ({
+        nodes: s.nodes.filter(n => n.id !== id),
+        edges: s.edges.filter(e => e.source !== id && e.target !== id)
+      }))
+    },
+
+    updateNodeData: (id, data) => {
+      set(s => ({
+        nodes: s.nodes.map(n =>
+          n.id === id ? { ...n, data: { ...n.data, ...data } as AudioNodeData & Record<string, unknown> } : n
+        )
+      }))
+    },
+
+    /**
+     * Change a node's channel count. Removes edges whose channel index no longer
+     * exists. Type-specific recreation is delegated to the audio engine (when the
+     * active workspace is live); otherwise it is a purely visual edit.
+     */
+    setNodeChannels: (id, type, channels) => {
+      channels = Math.max(1, Math.min(8, Math.round(channels)))
+
+      if (!activeEnabled()) {
+        // Visual-only: update the count and prune edges that reference channels
+        // beyond the new range.
+        set(s => {
+          const nodes = s.nodes.map(n => (n.id === id ? { ...n, data: { ...n.data, channels } } : n))
+          const edges = s.edges.filter(e => {
+            if (e.source === id && (parseHandle(e.sourceHandle)?.channel ?? 0) >= channels) return false
+            if (e.target === id && (parseHandle(e.targetHandle)?.channel ?? 0) >= channels) return false
+            return true
+          })
+          return { nodes, edges }
+        })
+        return
+      }
+
+      const lostEdges = audioEngine.getConnectionsBeyondChannel(id, channels)
+      const actualChannels = audioEngine.setChannelCount(id, type, channels)
+
+      set(s => {
+        const nodes = s.nodes.map(n =>
+          n.id === id ? { ...n, data: { ...n.data, channels: actualChannels } } : n
+        )
+        const edges = s.edges.filter(e => {
+          for (const lost of lostEdges) {
+            if (e.source === lost.source && e.target === lost.target &&
+                e.sourceHandle === `out-${lost.sourceChannel}` &&
+                e.targetHandle === `in-${lost.targetChannel}`) {
+              return false
+            }
+          }
+          return true
+        })
+        return { nodes, edges }
+      })
+    },
+
+    /** Override a single node's accent color (null clears it), recoloring its edges. */
+    setNodeColor: (id, color) => {
+      set(s => {
+        const nodes = s.nodes.map(n =>
+          n.id === id ? { ...n, data: { ...n.data, color: color ?? undefined } as AudioNodeData & Record<string, unknown> } : n
+        )
+        const srcNode = nodes.find(n => n.id === id)
+        const stroke = edgeStrokeFor(srcNode)
+        const edges = s.edges.map(e => (e.source === id ? { ...e, style: { ...e.style, stroke } } : e))
+        return { nodes, edges }
+      })
+    },
+
+    // ── Workspaces ────────────────────────────────────────────────────────────
+
+    addWorkspace: () => {
+      const id = genWorkspaceId()
+      set(s => {
+        const workspaces = flushActive(s)
+        const name = `Workspace ${workspaces.length + 1}`
+        return {
+          workspaces: [...workspaces, { id, name, enabled: true, nodes: [], edges: [] }],
+          activeWorkspaceId: id,
+          nodes: [],
+          edges: []
+        }
+      })
+    },
+
+    removeWorkspace: (id) => {
+      const s = get()
+      if (s.workspaces.length <= 1) return // always keep at least one
+      const target = s.workspaces.find(w => w.id === id)
+      if (target?.enabled) teardownEngine(id === s.activeWorkspaceId ? s.nodes : target.nodes)
+
+      const remaining = flushActive(s).filter(w => w.id !== id)
+      const activeId = id === s.activeWorkspaceId ? remaining[0].id : s.activeWorkspaceId
+      const active = remaining.find(w => w.id === activeId) ?? remaining[0]
+      set({ workspaces: remaining, activeWorkspaceId: active.id, nodes: active.nodes, edges: active.edges })
+    },
+
+    renameWorkspace: (id, name) => {
+      set(s => ({ workspaces: s.workspaces.map(w => (w.id === id ? { ...w, name } : w)) }))
+    },
+
+    setActiveWorkspace: (id) => {
+      set(s => {
+        if (id === s.activeWorkspaceId) return {}
+        const workspaces = flushActive(s)
+        const w = workspaces.find(x => x.id === id)
+        if (!w) return { workspaces }
+        return { workspaces, activeWorkspaceId: id, nodes: w.nodes, edges: w.edges }
+      })
+    },
+
+    setWorkspaceEnabled: async (id, enabled) => {
+      const flushed = flushActive(get())
+      const w = flushed.find(x => x.id === id)
+      if (!w || w.enabled === enabled) return
+      if (enabled) await buildEngine(w.nodes, w.edges)
+      else teardownEngine(w.nodes)
+      set({ workspaces: flushed.map(x => (x.id === id ? { ...x, enabled } : x)) })
+    },
+
+    setAllWorkspacesEnabled: async (enabled) => {
+      const flushed = flushActive(get())
+      for (const w of flushed) {
+        if (w.enabled === enabled) continue
+        if (enabled) await buildEngine(w.nodes, w.edges)
+        else teardownEngine(w.nodes)
+      }
+      set({ workspaces: flushed.map(w => ({ ...w, enabled })) })
+    },
+
+    // ── Audio initialization ───────────────────────────────────────────────
+
+    initAudio: async () => {
+      // Native is the default; if its addon isn't built, transparently use Web
+      // Audio this session so there's always sound.
+      await ensureBackendAvailable()
+      await audioEngine.init()
+      const devices = await audioEngine.getDevices()
+      set({ devices })
+
+      // Restore saved workspaces (and build the enabled ones) before marking
+      // ready, so the canvas appears already wired.
+      await get().loadGraph()
+      set({ initialized: true })
+
+      // Autosave on any change (debounced). Bound once.
+      if (!autosaveBound) {
+        autosaveBound = true
+        useAudioStore.subscribe(() => scheduleSave())
+      }
+
+      // Update devices when they change (e.g. plug/unplug) and auto-recover I/O.
+      navigator.mediaDevices.addEventListener('devicechange', () => {
+        get().refreshDevices().catch(console.error)
+        audioEngine.recoverInputs().catch(console.error)
+        audioEngine.recoverOutputs().catch(console.error)
+      })
+    },
+
+    /** Rebuild all workspaces from persisted storage; build the enabled graphs. */
+    loadGraph: async () => {
+      if (graphLoaded) return
+      graphLoaded = true
+      const saved = loadWorkspaces()
+      if (!saved || saved.workspaces.length === 0) {
+        const id = genWorkspaceId()
+        set({ workspaces: [{ id, name: 'Workspace 1', enabled: true, nodes: [], edges: [] }], activeWorkspaceId: id, nodes: [], edges: [] })
+        return
+      }
+      nodeCounter = Math.max(saved.counter ?? 0, nodeCounter, maxIdTail(saved.workspaces.flatMap(w => w.nodes.map(n => n.id))))
+      const workspaces = saved.workspaces.map(materializeWorkspace)
+      await applyWorkspaces(workspaces, saved.activeId)
+    },
+
+    clearGraph: () => {
+      const s = get()
+      if (activeEnabled()) teardownEngine(s.nodes)
+      set(st => ({
+        nodes: [], edges: [],
+        workspaces: st.workspaces.map(w => (w.id === st.activeWorkspaceId ? { ...w, nodes: [], edges: [] } : w))
+      }))
+      scheduleSave()
+    },
+
+    loadPreset: async (graph) => {
+      const s = get()
+      if (activeEnabled()) teardownEngine(s.nodes)
+      nodeCounter = Math.max(nodeCounter, graph.counter ?? 0, maxIdTail(graph.nodes.map(n => n.id)))
+      const { nodes, edges } = deserializeGraph(graph.nodes, graph.edges)
+      if (activeEnabled()) await buildEngine(nodes, edges)
+      set(st => ({
+        nodes, edges,
+        workspaces: st.workspaces.map(w => (w.id === st.activeWorkspaceId ? { ...w, nodes, edges } : w))
+      }))
+      scheduleSave()
+    },
+
+    exportConfig: () => {
+      const s = get()
+      const settings = useSettingsStore.getState()
+      const workspaces: SavedWorkspace[] = flushActive(s).map(w => ({
+        id: w.id, name: w.name, enabled: w.enabled,
+        nodes: serializeNodes(w.nodes), edges: serializeEdges(w.edges)
+      }))
+      return {
+        version: 2,
+        workspaces,
+        activeWorkspaceId: s.activeWorkspaceId,
+        counter: nodeCounter,
+        theme: settings.theme,
+        sidebarCollapsed: settings.sidebarCollapsed,
+        nodeScale: settings.nodeScale
+      }
+    },
+
+    importConfig: async (cfg) => {
+      teardownAllEngines()
+
+      let workspaces: Workspace[]
+      let activeId: string
+      if (Array.isArray(cfg.workspaces) && cfg.workspaces.length > 0) {
+        workspaces = cfg.workspaces.map(materializeWorkspace)
+        activeId = cfg.activeWorkspaceId ?? workspaces[0].id
+        nodeCounter = Math.max(nodeCounter, cfg.counter ?? 0, maxIdTail(cfg.workspaces.flatMap(w => w.nodes.map(n => n.id))))
+      } else if (cfg.graph?.nodes) {
+        const id = genWorkspaceId()
+        const { nodes, edges } = deserializeGraph(cfg.graph.nodes, cfg.graph.edges)
+        workspaces = [{ id, name: 'Workspace 1', enabled: true, nodes, edges }]
+        activeId = id
+        nodeCounter = Math.max(nodeCounter, cfg.graph.counter ?? 0, maxIdTail(cfg.graph.nodes.map(n => n.id)))
+      } else {
+        const id = genWorkspaceId()
+        workspaces = [{ id, name: 'Workspace 1', enabled: true, nodes: [], edges: [] }]
+        activeId = id
+      }
+
+      await applyWorkspaces(workspaces, activeId)
+      useSettingsStore.getState().importSettings({
+        theme: cfg.theme,
+        sidebarCollapsed: cfg.sidebarCollapsed,
+        nodeScale: cfg.nodeScale
+      })
+      scheduleSave()
+    },
+
+    refreshDevices: async () => {
+      const devices = await audioEngine.getDevices()
+      set({ devices })
     }
-
-    // Update devices when they change (e.g. plug/unplug) and auto-recover I/O.
-    navigator.mediaDevices.addEventListener('devicechange', () => {
-      get().refreshDevices().catch(console.error)
-      audioEngine.recoverInputs().catch(console.error)
-      audioEngine.recoverOutputs().catch(console.error)
-    })
-  },
-
-  /** Rebuild the engine graph + React Flow state from persisted storage. */
-  loadGraph: async () => {
-    if (graphLoaded) return
-    graphLoaded = true
-    const saved = loadSavedGraph()
-    if (!saved || saved.nodes.length === 0) return
-    await applySavedGraph(saved)
-  },
-
-  clearGraph: () => {
-    clearGraphInternal()
-    scheduleSave()
-  },
-
-  loadPreset: async (graph) => {
-    clearGraphInternal()
-    await applySavedGraph(graph)
-    scheduleSave()
-  },
-
-  exportConfig: () => {
-    const { nodes, edges } = get()
-    const s = useSettingsStore.getState()
-    return {
-      version: 1,
-      graph: serializeGraph(nodes, edges, nodeCounter),
-      theme: s.theme,
-      sidebarCollapsed: s.sidebarCollapsed,
-      nodeScale: s.nodeScale
-    }
-  },
-
-  importConfig: async (cfg) => {
-    clearGraphInternal()
-    if (cfg?.graph?.nodes) await applySavedGraph(cfg.graph)
-    useSettingsStore.getState().importSettings({
-      theme: cfg?.theme,
-      sidebarCollapsed: cfg?.sidebarCollapsed,
-      nodeScale: cfg?.nodeScale
-    })
-    scheduleSave()
-  },
-
-  refreshDevices: async () => {
-    const devices = await audioEngine.getDevices()
-    set({ devices })
   }
-}))
+})

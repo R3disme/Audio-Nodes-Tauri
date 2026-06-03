@@ -12,6 +12,7 @@
 export const DEFAULT_NODE_COLORS: Record<string, string> = {
   // Sources
   input:       '#1a5276',
+  fileplayer:  '#2f6d7d',
   application: '#1e4f8b',
   // Dynamics / tone
   volume:      '#784212',
@@ -27,13 +28,14 @@ export const DEFAULT_NODE_COLORS: Record<string, string> = {
   // Mixing / sinks
   mixer:       '#76448a',
   output:      '#1d6a3a',
-  virtual:     '#2f7d54'
+  virtual:     '#2f7d54',
+  recorder:    '#b23a48'
 }
 
 /** Stable ordering used by the theme editor and simple-theme hue generation. */
 export const NODE_TYPE_ORDER = [
-  'input', 'application', 'volume', 'eq', 'compressor', 'gate', 'pan',
-  'reverb', 'delay', 'chorus', 'distortion', 'mixer', 'output', 'virtual'
+  'input', 'fileplayer', 'application', 'volume', 'eq', 'compressor', 'gate', 'pan',
+  'reverb', 'delay', 'chorus', 'distortion', 'mixer', 'output', 'virtual', 'recorder'
 ] as const
 
 const FALLBACK = '#52525b'

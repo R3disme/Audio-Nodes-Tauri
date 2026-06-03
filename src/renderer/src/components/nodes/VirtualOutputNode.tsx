@@ -11,12 +11,18 @@ function looksVirtual(label: string): boolean {
   return /vb-?audio|cable|virtual|voicemeeter|vac|blackhole|loopback/i.test(label)
 }
 
+/** Our own driver's endpoints (native/driver — "Audio Nodes Virtual Cable"). */
+function isAudioNodesCable(label: string): boolean {
+  return /audio\s*nodes/i.test(label)
+}
+
 export function VirtualOutputNode({ id, data, selected }: NodeProps): JSX.Element {
   const d = data as unknown as OutputNodeData
   const devices = useAudioStore(s => s.devices)
   const updateNodeData = useAudioStore(s => s.updateNodeData)
 
   const hasVirtual = devices.outputs.some(dev => looksVirtual(dev.label))
+  const hasOurCable = devices.outputs.some(dev => isAudioNodesCable(dev.label))
 
   const setVolume = (volume: number): void => {
     updateNodeData(id, { volume })
@@ -69,9 +75,11 @@ export function VirtualOutputNode({ id, data, selected }: NodeProps): JSX.Elemen
            style={{ background: 'color-mix(in srgb, var(--node-virtual) 16%, transparent)', border: '1px solid color-mix(in srgb, var(--node-virtual) 35%, transparent)' }}>
         <Cable size={11} className="shrink-0 mt-0.5" style={{ color: 'var(--node-virtual)' }} />
         <span className="text-[9px] leading-snug" style={{ color: 'var(--c-text-dim)' }}>
-          {hasVirtual
-            ? 'Send this mix to a virtual cable, then pick that cable as the mic in Discord/OBS/etc.'
-            : 'No virtual cable detected. Install VB-Audio Virtual Cable, then select it here.'}
+          {hasOurCable
+            ? 'Audio Nodes Virtual Cable detected — select it above, then choose it as the mic in Discord/OBS/etc.'
+            : hasVirtual
+              ? 'Send this mix to a virtual cable, then pick that cable as the mic in Discord/OBS/etc.'
+              : 'No virtual cable detected. Build the Audio Nodes Virtual Cable (native/driver) or install VB-Cable, then select it here.'}
         </span>
       </div>
     </NodeBase>

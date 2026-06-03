@@ -32,6 +32,8 @@ export type AudioNodeType =
   | 'chorus'
   | 'distortion'
   | 'pan'
+  | 'recorder'
+  | 'fileplayer'
 
 export interface EQBand {
   frequency: number
@@ -116,6 +118,20 @@ interface ManagedNode {
   // so it can be routed to an independent device via the element's setSinkId.
   outputSink?: HTMLAudioElement
   outputDeviceId?: string
+
+  // For recorder: a MediaStreamDestination tapped by a MediaRecorder. The
+  // recorder is created lazily on the first record so an idle node is cheap.
+  recStreamDest?: MediaStreamAudioDestinationNode
+  recRecorder?: MediaRecorder
+  recChunks?: Blob[]
+  recActive?: boolean
+  recMime?: string
+  recExt?: string
+
+  // For file player: an <audio> element fed into the graph via a
+  // MediaElementAudioSourceNode (created once; the element src is swapped per file).
+  fileEl?: HTMLAudioElement
+  fileSource?: MediaElementAudioSourceNode
 
   // For input device auto-recovery:
   inputDeviceId?: string
@@ -224,6 +240,20 @@ class AudioEngine implements AudioBackend {
 
   private startMeterLoop(): void {
     const tick = (): void => {
+      // Minimized / hidden in the tray: skip all VU-meter work (analyser reads,
+      // RMS, DOM writes) — nobody can see it. Keep ticking gates, since audio
+      // still flows and a noise gate must keep gating in the background. This is
+      // the bulk of the idle-CPU saving when backgrounded.
+      if (typeof document !== 'undefined' && document.hidden) {
+        this.nodes.forEach((node) => {
+          if (node.type === 'gate' && node.gateRefs) {
+            for (const g of node.gateRefs) this.tickGate(g)
+          }
+        })
+        this.rafId = requestAnimationFrame(tick)
+        return
+      }
+
       this.nodes.forEach((node, id) => {
         node.meters.forEach((analyser, idx) => {
           // Skip the RMS work entirely when nothing is displaying this meter.
@@ -513,7 +543,12 @@ class AudioEngine implements AudioBackend {
     const audioEl = new Audio()
     audioEl.srcObject = streamDest.stream
     audioEl.autoplay = true
-    void audioEl.play().catch(e => console.warn('Output element play() failed:', e))
+    // A play() interrupted by an immediate pause()/teardown (e.g. toggling a
+    // workspace off right after adding an output) rejects with AbortError —
+    // that's benign, so only surface genuine playback failures.
+    void audioEl.play().catch((e: DOMException) => {
+      if (e?.name !== 'AbortError') console.warn('Output element play() failed:', e)
+    })
 
     this.nodes.set(id, {
       type,
@@ -547,6 +582,152 @@ class AudioEngine implements AudioBackend {
         if (node.outputDeviceId) await el.setSinkId(node.outputDeviceId || '')
         if (el.paused) await el.play()
       } catch { /* device not ready yet — will retry on next devicechange */ }
+    }
+  }
+
+  // ── Recorder (sink → MediaRecorder → file) ──────────────────────────────
+
+  /** First MediaRecorder mime type the platform supports, with a file extension. */
+  private pickRecorderMime(): { mime: string; ext: string } {
+    const candidates: Array<{ mime: string; ext: string }> = [
+      { mime: 'audio/webm;codecs=opus', ext: 'webm' },
+      { mime: 'audio/webm', ext: 'webm' },
+      { mime: 'audio/ogg;codecs=opus', ext: 'ogg' }
+    ]
+    for (const c of candidates) {
+      if (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(c.mime)) return c
+    }
+    return { mime: '', ext: 'webm' } // let the browser choose its default container
+  }
+
+  /** A sink that captures whatever reaches it into a downloadable recording. */
+  createRecorderNode(id: string): void {
+    const ctx = this.context
+    const gain = ctx.createGain()
+    const analyser = this.makeAnalyser()
+    const streamDest = ctx.createMediaStreamDestination()
+    gain.connect(analyser)
+    analyser.connect(streamDest)
+
+    this.nodes.set(id, {
+      type: 'recorder',
+      inputs: [gain],
+      // Pass the signal through (post input-gain) so it can be monitored / routed
+      // onward while recording — e.g. play it straight to an Output.
+      outputs: [analyser],
+      meters: [analyser],
+      gainRefs: [gain],
+      recStreamDest: streamDest,
+      recActive: false
+    })
+    this.notifyNodeSubs()
+  }
+
+  startRecording(id: string): boolean {
+    const node = this.nodes.get(id)
+    if (!node?.recStreamDest) return false
+    if (node.recActive) return true
+    const { mime, ext } = this.pickRecorderMime()
+    try {
+      const rec = mime ? new MediaRecorder(node.recStreamDest.stream, { mimeType: mime })
+                       : new MediaRecorder(node.recStreamDest.stream)
+      node.recChunks = []
+      rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) node.recChunks!.push(e.data) }
+      rec.start()
+      node.recRecorder = rec
+      node.recActive = true
+      node.recMime = rec.mimeType || mime
+      node.recExt = ext
+      this.notifyNodeSubs()
+      return true
+    } catch (e) {
+      console.warn('startRecording failed:', e)
+      return false
+    }
+  }
+
+  stopRecording(id: string): Promise<{ blob: Blob; mimeType: string; extension: string } | null> {
+    const node = this.nodes.get(id)
+    const rec = node?.recRecorder
+    if (!node || !rec || !node.recActive) return Promise.resolve(null)
+    return new Promise((resolve) => {
+      rec.onstop = () => {
+        const mimeType = node.recMime || 'audio/webm'
+        const blob = new Blob(node.recChunks ?? [], { type: mimeType })
+        node.recChunks = []
+        node.recActive = false
+        node.recRecorder = undefined
+        this.notifyNodeSubs()
+        resolve({ blob, mimeType, extension: node.recExt || 'webm' })
+      }
+      try { rec.stop() } catch { resolve(null) }
+    })
+  }
+
+  isRecording(id: string): boolean {
+    return this.nodes.get(id)?.recActive ?? false
+  }
+
+  // ── File player (source: an audio file → the graph) ─────────────────────
+
+  /** A source node that plays a local audio file into the graph. */
+  createFilePlayerNode(id: string): void {
+    const ctx = this.context
+    const el = new Audio()
+    el.preload = 'auto'
+    // Routing the element through a MediaElementSource sends its audio into the
+    // graph instead of straight to the speakers, so it behaves like any source.
+    const source = ctx.createMediaElementSource(el)
+    const gain = ctx.createGain()
+    const analyser = this.makeAnalyser()
+    source.connect(gain)
+    gain.connect(analyser)
+
+    this.nodes.set(id, {
+      type: 'fileplayer',
+      inputs: [],
+      outputs: [analyser],
+      meters: [analyser],
+      gainRefs: [gain],
+      fileEl: el,
+      fileSource: source
+    })
+    this.notifyNodeSubs()
+  }
+
+  /** Point the player at a (blob/object) URL. */
+  loadFilePlayer(id: string, url: string): void {
+    const el = this.nodes.get(id)?.fileEl
+    if (!el) return
+    el.src = url
+    el.load()
+  }
+
+  playFilePlayer(id: string): void {
+    const el = this.nodes.get(id)?.fileEl
+    if (el?.src) void el.play().catch(e => console.warn('File player play() failed:', e))
+  }
+
+  pauseFilePlayer(id: string): void {
+    this.nodes.get(id)?.fileEl?.pause()
+  }
+
+  setFilePlayerLoop(id: string, loop: boolean): void {
+    const el = this.nodes.get(id)?.fileEl
+    if (el) el.loop = loop
+  }
+
+  seekFilePlayer(id: string, seconds: number): void {
+    const el = this.nodes.get(id)?.fileEl
+    if (el && isFinite(seconds)) el.currentTime = Math.max(0, seconds)
+  }
+
+  getFilePlayerStatus(id: string): { playing: boolean; currentTime: number; duration: number } {
+    const el = this.nodes.get(id)?.fileEl
+    return {
+      playing: !!el && !el.paused && !el.ended,
+      currentTime: el?.currentTime ?? 0,
+      duration: el && isFinite(el.duration) ? el.duration : 0
     }
   }
 
@@ -1248,6 +1429,19 @@ class AudioEngine implements AudioBackend {
     node.mediaStream?.getTracks().forEach(t => t.stop())
     if (node.appReconnectTimer) window.clearTimeout(node.appReconnectTimer)
     if (node.inputReconnectTimer) window.clearTimeout(node.inputReconnectTimer)
+
+    // Stop an in-progress recording (the captured chunks are discarded).
+    if (node.recRecorder && node.recActive) {
+      try { node.recRecorder.stop() } catch { /* already stopped */ }
+    }
+    node.recStreamDest?.stream.getTracks().forEach(t => t.stop())
+
+    // Stop + release a file player's media element.
+    if (node.fileEl) {
+      node.fileEl.pause()
+      node.fileEl.removeAttribute('src')
+      node.fileEl.load()
+    }
 
     // Stop and detach an output node's playback element so it doesn't keep
     // pulling from the (now-disconnected) audio graph.

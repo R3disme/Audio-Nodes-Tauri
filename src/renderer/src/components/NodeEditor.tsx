@@ -21,17 +21,20 @@ import { GateNode } from './nodes/GateNode'
 import { MixerNode } from './nodes/MixerNode'
 import { ApplicationNode } from './nodes/ApplicationNode'
 import { VirtualOutputNode } from './nodes/VirtualOutputNode'
+import { FilePlayerNode } from './nodes/FilePlayerNode'
 import { ReverbNode } from './nodes/ReverbNode'
 import { DelayNode } from './nodes/DelayNode'
 import { ChorusNode } from './nodes/ChorusNode'
 import { DistortionNode } from './nodes/DistortionNode'
 import { PanNode } from './nodes/PanNode'
+import { RecorderNode } from './nodes/RecorderNode'
 import { DEFAULT_NODE_COLORS } from '@renderer/lib/nodeColors'
 import { useSettingsStore } from '@renderer/store/settingsStore'
 import { memo, useEffect, useCallback } from 'react'
 
 const nodeTypes: NodeTypes = {
   input:       memo(InputNode),
+  fileplayer:  memo(FilePlayerNode),
   application: memo(ApplicationNode),
   output:      memo(OutputNode),
   virtual:     memo(VirtualOutputNode),
@@ -44,7 +47,8 @@ const nodeTypes: NodeTypes = {
   chorus:      memo(ChorusNode),
   distortion:  memo(DistortionNode),
   pan:         memo(PanNode),
-  mixer:       memo(MixerNode)
+  mixer:       memo(MixerNode),
+  recorder:    memo(RecorderNode)
 }
 
 const defaultEdgeOptions = {

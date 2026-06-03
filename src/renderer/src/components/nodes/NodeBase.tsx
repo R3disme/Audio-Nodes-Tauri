@@ -7,8 +7,10 @@ import { DEFAULT_NODE_COLORS, darken } from '@renderer/lib/nodeColors'
 
 const headerIcons: Record<string, string> = {
   input:       '🎙',
+  fileplayer:  '🎵',
   application: '🪟',
   output:      '🔊',
+  virtual:     '🎧',
   volume:      '🔈',
   eq:          '🎚',
   compressor:  '📉',
@@ -18,7 +20,8 @@ const headerIcons: Record<string, string> = {
   chorus:      '🌀',
   distortion:  '⚡',
   pan:         '↔',
-  mixer:       '🎛'
+  mixer:       '🎛',
+  recorder:    '⏺'
 }
 
 interface NodeBaseProps {

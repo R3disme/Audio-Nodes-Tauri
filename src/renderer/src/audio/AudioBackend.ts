@@ -47,6 +47,21 @@ export interface AudioBackend {
   setOutputDevice(id: string, deviceId: string): Promise<void>
   recoverOutputs(): Promise<void>
 
+  // ── Recorder (sink that captures to a file) ────────────────────────────────
+  createRecorderNode(id: string): void
+  startRecording(id: string): boolean
+  stopRecording(id: string): Promise<{ blob: Blob; mimeType: string; extension: string } | null>
+  isRecording(id: string): boolean
+
+  // ── File player (source that plays an audio file) ──────────────────────────
+  createFilePlayerNode(id: string): void
+  loadFilePlayer(id: string, url: string): void
+  playFilePlayer(id: string): void
+  pauseFilePlayer(id: string): void
+  setFilePlayerLoop(id: string, loop: boolean): void
+  seekFilePlayer(id: string, seconds: number): void
+  getFilePlayerStatus(id: string): { playing: boolean; currentTime: number; duration: number }
+
   // ── Node creation ─────────────────────────────────────────────────────────
   createVolumeNode(id: string, channels?: number): void
   createEQNode(id: string, channels?: number, bands?: EQBand[]): void

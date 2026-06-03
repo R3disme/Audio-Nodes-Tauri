@@ -22,6 +22,7 @@
 
   /* Node accent palette (and darker socket-outline variants) */
   --node-input: #1a5276;        --node-input-dark: #0d293b;
+  --node-fileplayer: #2f6d7d;   --node-fileplayer-dark: #173740;
   --node-application: #1e4f8b;  --node-application-dark: #0f2846;
   --node-output: #1d6a3a;       --node-output-dark: #0f351d;
   --node-virtual: #2f7d54;      --node-virtual-dark: #173f2a;
@@ -35,6 +36,7 @@
   --node-chorus: #8e3b8e;       --node-chorus-dark: #471d47;
   --node-distortion: #a35a1e;   --node-distortion-dark: #512d0f;
   --node-mixer: #76448a;        --node-mixer-dark: #3b2245;
+  --node-recorder: #b23a48;     --node-recorder-dark: #591d24;
 
   /* Global node UI scale (adaptive scale control) */
   --ui-scale: 1;

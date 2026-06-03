@@ -46,6 +46,10 @@ class NativeEngine implements AudioBackend {
   /** Latest per-channel compressor gain reduction, keyed `${id}#gr${ch}`. */
   private grCache = new Map<string, number>()
 
+  /** Cached engine latency (ms); refreshed on a timer since getLatencyMs is sync. */
+  private latencyCache = 0
+  private latencyTimer: number | null = null
+
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   async init(): Promise<void> {
@@ -62,10 +66,18 @@ class NativeEngine implements AudioBackend {
       console.warn('[native engine] init failed:', e)
     }
     this.startMeterLoop()
+
+    // Latency is reported by the engine from its live device buffer sizes. Poll it
+    // on a slow timer and cache it, since getLatencyMs() is synchronous.
+    const pollLatency = (): void => {
+      window.api.audio.latency().then(v => { this.latencyCache = v }).catch(() => {})
+    }
+    pollLatency()
+    this.latencyTimer = window.setInterval(pollLatency, 2000)
   }
 
   getLatencyMs(): number {
-    return 0
+    return Math.round(this.latencyCache)
   }
 
   // ── Meters: poll the addon each frame, dispatch to DOM subscribers ─────────
@@ -75,7 +87,10 @@ class NativeEngine implements AudioBackend {
     let busy = false
     const tick = (): void => {
       this.rafId = requestAnimationFrame(tick)
-      if (busy || this.meterSubs.size === 0) return
+      // Minimized / hidden in the tray: stop polling the engine for meters (saves
+      // a per-frame IPC round-trip). The native gate runs on the audio thread, so
+      // it's unaffected. Resumes automatically when the window is shown again.
+      if (busy || this.meterSubs.size === 0 || (typeof document !== 'undefined' && document.hidden)) return
       busy = true
       window.api.audio
         .pollMeters()
@@ -178,6 +193,58 @@ class NativeEngine implements AudioBackend {
   }
 
   async recoverOutputs(): Promise<void> {}
+
+  // ── Recorder ──────────────────────────────────────────────────────────────
+  // Capture-to-file is renderer-side (MediaRecorder) on the Web Audio engine.
+  // The native engine has no MediaStream to tap yet, so the node exists as a
+  // passthrough sink and recording is reported as unsupported.
+
+  private warnedNoRec = false
+
+  createRecorderNode(id: string): void {
+    window.api.audio.createNode(id, 'recorder', 1, '')
+  }
+
+  startRecording(_id: string): boolean {
+    if (!this.warnedNoRec) {
+      console.warn('[native engine] recording is not yet supported — switch to the Web Audio engine to record.')
+      this.warnedNoRec = true
+    }
+    return false
+  }
+
+  async stopRecording(_id: string): Promise<{ blob: Blob; mimeType: string; extension: string } | null> {
+    return null
+  }
+
+  isRecording(_id: string): boolean {
+    return false
+  }
+
+  // ── File player ───────────────────────────────────────────────────────────
+  // Decoding a file lives in the renderer (HTMLAudioElement); the native engine
+  // has no element to tap yet, so the node is a passthrough and transport is a
+  // no-op. (Native file playback = a future Rust decode path.)
+  private warnedNoFile = false
+  private warnFile(): void {
+    if (!this.warnedNoFile) {
+      console.warn('[native engine] file player is not yet supported — switch to the Web Audio engine.')
+      this.warnedNoFile = true
+    }
+  }
+
+  createFilePlayerNode(id: string): void {
+    window.api.audio.createNode(id, 'fileplayer', 1, '')
+  }
+
+  loadFilePlayer(_id: string, _url: string): void { this.warnFile() }
+  playFilePlayer(_id: string): void { this.warnFile() }
+  pauseFilePlayer(_id: string): void {}
+  setFilePlayerLoop(_id: string, _loop: boolean): void {}
+  seekFilePlayer(_id: string, _seconds: number): void {}
+  getFilePlayerStatus(_id: string): { playing: boolean; currentTime: number; duration: number } {
+    return { playing: false, currentTime: 0, duration: 0 }
+  }
 
   // ── Node creation ─────────────────────────────────────────────────────────
 

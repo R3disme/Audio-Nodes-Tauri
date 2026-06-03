@@ -1,0 +1,3 @@
+[submodule "native/driver/vendor/Virtual-Audio-Driver"]
+	path = native/driver/vendor/Virtual-Audio-Driver
+	url = https://github.com/VirtualDrivers/Virtual-Audio-Driver

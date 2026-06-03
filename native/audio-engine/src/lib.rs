@@ -174,6 +174,12 @@ impl NativeAudioEngine {
         self.engine.meters()
     }
 
+    /// Estimated input→output latency in ms (from the live device buffer sizes).
+    #[napi]
+    pub fn latency_ms(&self) -> f64 {
+        self.engine.latency_ms()
+    }
+
     // ── Device enumeration ─────────────────────────────────────────────────
 
     /// Capture (input) endpoints, enumerated via cpal/WASAPI.

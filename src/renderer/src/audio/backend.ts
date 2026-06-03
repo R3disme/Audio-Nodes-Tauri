@@ -2,8 +2,9 @@
 // Backend selector
 //
 // Single place that decides which `AudioBackend` implementation is live:
-//   - 'webaudio' (default): the in-renderer Web Audio engine. Fully featured.
-//   - 'native':   the Rust engine via IPC. Incomplete during the migration.
+//   - 'native' (default): the Rust engine via IPC. Faster; the main mode.
+//   - 'webaudio':         the in-renderer Web Audio engine. Fully-featured fallback
+//                         (recorder/file-player/app-capture still live here).
 //
 // Everything else in the renderer imports the stable `audioEngine` facade from
 // here instead of reaching into a concrete engine. The facade is a Proxy that
@@ -28,12 +29,12 @@ function readInitialKind(): EngineKind {
     const raw = localStorage.getItem(SETTINGS_KEY)
     if (raw) {
       const parsed = JSON.parse(raw) as { engine?: unknown }
-      if (parsed?.engine === 'native') return 'native'
+      if (parsed?.engine === 'webaudio') return 'webaudio'
     }
   } catch {
-    /* corrupt/absent settings — fall back to Web Audio */
+    /* corrupt/absent settings — default to native */
   }
-  return 'webaudio'
+  return 'native'
 }
 
 let activeKind: EngineKind = readInitialKind()
@@ -46,6 +47,22 @@ export function getActiveEngineKind(): EngineKind {
 export function setActiveEngine(kind: EngineKind): void {
   activeKind = kind
   active = kind === 'native' ? nativeEngine : webAudioEngine
+}
+
+/**
+ * If native is selected but the Rust addon isn't built/available, fall back to
+ * Web Audio for this session (without changing the persisted setting) so the app
+ * never goes silent on a fresh clone. Call once at startup before init.
+ */
+export async function ensureBackendAvailable(): Promise<void> {
+  if (activeKind !== 'native') return
+  try {
+    const info = await window.api.audio.info()
+    if (!info) throw new Error('addon unavailable')
+  } catch {
+    console.warn('[backend] native engine unavailable — using Web Audio this session. Run "npm run build:native" to enable native.')
+    setActiveEngine('webaudio')
+  }
 }
 
 /**

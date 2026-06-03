@@ -15,6 +15,7 @@ interface NodeEntry {
 
 const NODE_PALETTE: NodeEntry[] = [
   { type: 'input',       label: 'Input',        icon: '🎙', description: 'Microphone, line-in',     category: 'source' },
+  { type: 'fileplayer',  label: 'File Player',  icon: '🎵', description: 'Play an audio file',      category: 'source' },
   { type: 'application', label: 'Application',  icon: '🪟', description: 'Capture window audio',     category: 'source' },
   { type: 'volume',      label: 'Volume',       icon: '🔈', description: 'Gain & mute',              category: 'effect' },
   { type: 'eq',          label: 'Equalizer',    icon: '🎚', description: '5-band parametric EQ',     category: 'effect' },
@@ -27,7 +28,8 @@ const NODE_PALETTE: NodeEntry[] = [
   { type: 'distortion',  label: 'Distortion',   icon: '⚡', description: 'Saturation & drive',       category: 'creative' },
   { type: 'mixer',       label: 'Mixer',        icon: '🎛', description: '4-channel sum',            category: 'mix' },
   { type: 'output',      label: 'Output',       icon: '🔊', description: 'Speakers / headphones',    category: 'sink' },
-  { type: 'virtual',     label: 'Virtual Out',  icon: '🎧', description: 'Route to other apps',      category: 'sink' }
+  { type: 'virtual',     label: 'Virtual Out',  icon: '🎧', description: 'Route to other apps',      category: 'sink' },
+  { type: 'recorder',    label: 'Recorder',     icon: '⏺', description: 'Capture audio to a file',  category: 'sink' }
 ]
 
 const CATEGORY_LABELS: Record<Category, string> = {
@@ -141,7 +143,7 @@ export function Sidebar(): JSX.Element {
 
       <div className="mt-auto p-3" style={{ borderTop: '1px solid var(--c-border)' }}>
         <p className="text-[9px] leading-relaxed" style={{ color: 'var(--c-text-dim)', opacity: 0.8 }}>
-          For per-app isolation, route the app through a virtual audio cable (e.g. VB-Cable) and pick it as an Input device.
+          For per-app isolation, route the app through a virtual audio cable — the built-in Audio Nodes Virtual Cable (native/driver) or VB-Cable — and pick it as an Input device.
         </p>
       </div>
     </aside>
