@@ -49,6 +49,9 @@ interface Window {
       destroyNode: (id: string) => void
       pollMeters: () => Promise<Record<string, number>>
       latency: () => Promise<number>
+      startRecording: (id: string) => void
+      stopRecording: (id: string) => Promise<{ bytes: Uint8Array; ext: string; mime: string } | null>
+      pushCapture: (id: string, samples: Float32Array) => void
     }
   }
 }

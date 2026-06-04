@@ -55,7 +55,12 @@ const api = {
       ipcRenderer.send('audio:set-param', id, param, index, value),
     destroyNode: (id: string): void => ipcRenderer.send('audio:destroy-node', id),
     pollMeters: (): Promise<Record<string, number>> => ipcRenderer.invoke('audio:poll-meters'),
-    latency: (): Promise<number> => ipcRenderer.invoke('audio:latency')
+    latency: (): Promise<number> => ipcRenderer.invoke('audio:latency'),
+    startRecording: (id: string): void => ipcRenderer.send('audio:start-recording', id),
+    stopRecording: (id: string): Promise<{ bytes: Uint8Array; ext: string; mime: string } | null> =>
+      ipcRenderer.invoke('audio:stop-recording', id),
+    pushCapture: (id: string, samples: Float32Array): void =>
+      ipcRenderer.send('audio:push-capture', id, samples)
   }
 }
 

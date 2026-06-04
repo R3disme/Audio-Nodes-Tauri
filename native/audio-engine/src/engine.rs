@@ -42,12 +42,21 @@ use std::thread;
 use arc_swap::ArcSwap;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, OutputCallbackInfo, Sample, SampleFormat, SizedSample, StreamConfig};
-use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::{HeapCons, HeapProd, HeapRb};
 
 const MAX_BLOCK_FRAMES: usize = 8192;
 const RING_FRAMES: usize = 48_000; // ~1s of stereo headroom
 const MAX_DEPTH: u32 = 64; // graph-recursion / cycle guard
+
+// Input/loopback latency cushion. The capture ring is read only once a cushion of
+// this many frames has built up, so ordinary jitter between the (independent)
+// capture and render device callbacks can't drain it to silence — that empty-ring
+// underrun is what produced the constant crackle / "not smooth" sound. If slow
+// clock drift grows the cushion past MAX, we drop back down to TARGET to keep
+// latency bounded; if it ever runs dry, we re-prime.
+const TARGET_LATENCY_FRAMES: usize = 1536; // ~32 ms @48k — absorbs callback jitter
+const MAX_LATENCY_FRAMES: usize = 12_288; // ~256 ms — cap before re-centering
 
 // ── Meters (lock-free f32 in an AtomicU32) ──────────────────────────────────
 
@@ -104,6 +113,10 @@ pub enum Kind {
     Chorus,
     Distortion,
     Pan,
+    /// System-audio loopback capture (the Application node). Pops a ring like Input.
+    Loopback,
+    /// Records its incoming signal to a file. Passes audio through.
+    Recorder,
     /// Anything unmapped — audio passes through untouched.
     Passthrough,
 }
@@ -111,7 +124,9 @@ pub enum Kind {
 impl Kind {
     fn from_type(t: &str) -> Kind {
         match t {
-            "input" | "application" => Kind::Input,
+            "input" => Kind::Input,
+            "application" => Kind::Loopback,
+            "recorder" => Kind::Recorder,
             "output" | "virtual" => Kind::Output,
             "volume" => Kind::Volume,
             "mixer" => Kind::Mixer,
@@ -150,8 +165,14 @@ pub struct NodeState {
     muted: AtomicBool,
     /// One meter per channel (mixer/input/output have a single output meter).
     meters: Vec<Arc<Meter>>,
-    /// Input nodes only: the consumer end of the capture ring buffer.
+    /// Input/loopback nodes: the consumer end of the capture ring buffer.
     consumer: Mutex<Option<HeapCons<f32>>>,
+    /// Input/loopback only: false until a latency cushion has accumulated in the
+    /// ring. Gates reads so startup / callback jitter can't drain it to silence.
+    primed: AtomicBool,
+    /// Loopback (application) nodes: the producer end, fed by `push_capture` with
+    /// PCM the renderer captures via getDisplayMedia (system loopback).
+    producer: Mutex<Option<HeapProd<f32>>>,
     /// DSP nodes only: per-channel processor state (locked only by the one audio
     /// callback that renders this node; control-thread param edits also lock it
     /// briefly).
@@ -160,6 +181,10 @@ pub struct NodeState {
     mixer_gains: Vec<AtomicU32>,
     /// Compressor only: per-channel gain-reduction readout (dB, ≤ 0).
     reduction: Vec<Arc<Meter>>,
+    /// Recorder only: whether it's actively capturing, and the interleaved-stereo
+    /// accumulator (appended by the audio thread, drained → WAV on stop).
+    recording: AtomicBool,
+    rec_buf: Mutex<Vec<f32>>,
 }
 
 impl NodeState {
@@ -196,10 +221,16 @@ struct GraphSnapshot {
     nodes: HashMap<String, Arc<NodeState>>,
     /// Edges grouped by target id (the inputs feeding each node).
     incoming: HashMap<String, Vec<Edge>>,
+    /// Recorder node ids — evaluated as extra roots so they capture even when not
+    /// routed to an output.
+    recorders: Vec<String>,
+    /// The single output that drives recorder evaluation (lowest id), so multiple
+    /// outputs don't double-record.
+    primary_output: Option<String>,
 }
 impl GraphSnapshot {
     fn empty() -> GraphSnapshot {
-        GraphSnapshot { nodes: HashMap::new(), incoming: HashMap::new() }
+        GraphSnapshot { nodes: HashMap::new(), incoming: HashMap::new(), recorders: Vec::new(), primary_output: None }
     }
 }
 
@@ -280,16 +311,29 @@ impl Engine {
             Vec::new()
         };
 
+        // Loopback (application) nodes are fed PCM over IPC (not a cpal stream), so
+        // give them their capture ring up front.
+        let (consumer, producer) = if kind == Kind::Loopback {
+            let (prod, cons) = HeapRb::<f32>::new(RING_FRAMES * 2).split();
+            (Some(cons), Some(prod))
+        } else {
+            (None, None)
+        };
+
         let node = Arc::new(NodeState {
             kind,
             channels: ch,
             gain: AtomicU32::new(1f32.to_bits()),
             muted: AtomicBool::new(false),
             meters,
-            consumer: Mutex::new(None),
+            consumer: Mutex::new(consumer),
+            primed: AtomicBool::new(false),
+            producer: Mutex::new(producer),
             dsp,
             mixer_gains,
             reduction,
+            recording: AtomicBool::new(false),
+            rec_buf: Mutex::new(Vec::new()),
         });
 
         self.shared.nodes.lock().unwrap().insert(id.to_string(), node);
@@ -320,7 +364,8 @@ impl Engine {
             return 0.0;
         }
         let frames = self.shared.in_frames.load(Ordering::Relaxed)
-            + self.shared.out_frames.load(Ordering::Relaxed);
+            + self.shared.out_frames.load(Ordering::Relaxed)
+            + TARGET_LATENCY_FRAMES as u32; // the input cushion is real latency too
         (frames as f64 / sr as f64 * 1000.0).round()
     }
 
@@ -375,6 +420,56 @@ impl Engine {
                 }
             }
         }
+    }
+
+    /// Feed captured PCM (interleaved stereo f32) into a loopback (application)
+    /// node's ring. Called from the renderer's getDisplayMedia capture over IPC.
+    pub fn push_capture(&self, id: &str, samples: &[f32]) {
+        let nodes = self.shared.nodes.lock().unwrap();
+        if let Some(node) = nodes.get(id) {
+            if let Some(prod) = node.producer.lock().unwrap().as_mut() {
+                prod.push_slice(samples);
+            }
+        }
+    }
+
+    /// Arm a recorder node: clear its buffer and start appending its signal.
+    pub fn start_recording(&self, id: &str) -> bool {
+        let nodes = self.shared.nodes.lock().unwrap();
+        let Some(node) = nodes.get(id) else { return false };
+        if node.kind != Kind::Recorder {
+            return false;
+        }
+        {
+            let mut buf = node.rec_buf.lock().unwrap();
+            buf.clear();
+            // Pre-reserve ~60s of interleaved stereo to limit reallocations on the
+            // audio thread (it still grows for longer takes).
+            let sr = self.shared.sr.load(Ordering::Relaxed).max(48000) as usize;
+            buf.reserve(sr * 2 * 60);
+        }
+        node.recording.store(true, Ordering::Relaxed);
+        true
+    }
+
+    /// Stop a recorder, write its buffer to a temp WAV, and return the file path.
+    pub fn stop_recording(&self, id: &str) -> Option<String> {
+        let samples = {
+            let nodes = self.shared.nodes.lock().unwrap();
+            let node = nodes.get(id)?;
+            if !node.recording.swap(false, Ordering::Relaxed) {
+                return None;
+            }
+            let taken = std::mem::take(&mut *node.rec_buf.lock().unwrap());
+            taken
+        };
+        if samples.is_empty() {
+            return None;
+        }
+        let sr = self.shared.sr.load(Ordering::Relaxed).max(48000);
+        let path = std::env::temp_dir().join(format!("audionodes-rec-{}.wav", now_ms()));
+        write_wav_i16(&path, &samples, sr, 2).ok()?;
+        Some(path.to_string_lossy().into_owned())
     }
 
     pub fn connect(&self, source: &str, src_ch: u32, target: &str, tgt_ch: u32) {
@@ -452,9 +547,22 @@ impl Engine {
             }
         }
 
+        let recorders: Vec<String> = nodes
+            .iter()
+            .filter(|(_, n)| n.kind == Kind::Recorder)
+            .map(|(id, _)| id.clone())
+            .collect();
+        let primary_output: Option<String> = nodes
+            .iter()
+            .filter(|(_, n)| n.kind == Kind::Output)
+            .map(|(id, _)| id.clone())
+            .min();
+
         self.shared.snapshot.store(Arc::new(GraphSnapshot {
             nodes: nodes.clone(),
             incoming,
+            recorders,
+            primary_output,
         }));
     }
 }
@@ -481,6 +589,21 @@ impl Drop for Engine {
 
 // ── Graph evaluation (runs inside an output stream callback) ─────────────────
 
+/// Pop and discard `count` samples from a consumer (used to cap input latency
+/// when slow clock drift has over-filled the cushion).
+fn drop_samples(cons: &mut HeapCons<f32>, count: usize) {
+    let mut scratch = [0.0f32; 2048];
+    let mut left = count;
+    while left > 0 {
+        let take = left.min(scratch.len());
+        let popped = cons.pop_slice(&mut scratch[..take]);
+        if popped == 0 {
+            break;
+        }
+        left -= popped;
+    }
+}
+
 /// Evaluate node `id`, output channel `ch`, into a fresh interleaved-stereo block
 /// of `frames * 2` samples. `cache` pops each input exactly once per block so a
 /// fan-out from one input within this output's graph stays correct.
@@ -501,8 +624,8 @@ fn eval(
         return vec![0.0; n];
     }
 
-    // Input node: pop the capture ring (once per block), apply input gain + meter.
-    if node.kind == Kind::Input {
+    // Input / loopback node: pop the capture ring (once per block), gain + meter.
+    if node.kind == Kind::Input || node.kind == Kind::Loopback {
         if let Some(cached) = cache.get(id) {
             return cached.clone();
         }
@@ -510,7 +633,26 @@ fn eval(
         {
             let mut guard = node.consumer.lock().unwrap();
             if let Some(cons) = guard.as_mut() {
-                cons.pop_slice(&mut b);
+                let target = TARGET_LATENCY_FRAMES * 2;
+                let max = MAX_LATENCY_FRAMES * 2;
+                let avail = cons.occupied_len();
+                // Build the cushion before the first read so jitter can't underrun.
+                if !node.primed.load(Ordering::Relaxed) && avail >= target + n {
+                    node.primed.store(true, Ordering::Relaxed);
+                }
+                if node.primed.load(Ordering::Relaxed) {
+                    if avail < n {
+                        // Ran dry → emit silence (b stays zero) and re-prime.
+                        node.primed.store(false, Ordering::Relaxed);
+                    } else {
+                        // Slow clock drift grew the cushion → drop back to target so
+                        // latency stays bounded instead of accumulating delay.
+                        if avail > max {
+                            drop_samples(cons, avail - target);
+                        }
+                        cons.pop_slice(&mut b);
+                    }
+                }
             }
         }
         let g = node.gain_lin();
@@ -578,7 +720,13 @@ fn eval(
                 slot.lock().unwrap().process(&mut acc, sr);
             }
         }
-        _ => {} // passthrough
+        _ => {} // passthrough (incl. recorder)
+    }
+
+    // Recorder: append the (interleaved-stereo) signal while armed.
+    if node.kind == Kind::Recorder && node.recording.load(Ordering::Relaxed) {
+        let mut buf = node.rec_buf.lock().unwrap();
+        buf.extend_from_slice(&acc);
     }
 
     let mi = ch.min(node.meters.len().saturating_sub(1));
@@ -648,6 +796,41 @@ fn find_device(host: &cpal::Host, id: &str, output: bool) -> Option<Device> {
         .or_else(default)
 }
 
+fn now_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+/// Write interleaved-stereo f32 samples to a 16-bit PCM WAV file.
+fn write_wav_i16(path: &std::path::Path, samples: &[f32], sr: u32, channels: u16) -> std::io::Result<()> {
+    use std::io::Write;
+    let bits: u16 = 16;
+    let block_align: u16 = channels * bits / 8;
+    let byte_rate: u32 = sr * block_align as u32;
+    let data_bytes: u32 = (samples.len() * 2) as u32;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    f.write_all(b"RIFF")?;
+    f.write_all(&(36 + data_bytes).to_le_bytes())?;
+    f.write_all(b"WAVE")?;
+    f.write_all(b"fmt ")?;
+    f.write_all(&16u32.to_le_bytes())?; // PCM fmt chunk size
+    f.write_all(&1u16.to_le_bytes())?; // format = PCM
+    f.write_all(&channels.to_le_bytes())?;
+    f.write_all(&sr.to_le_bytes())?;
+    f.write_all(&byte_rate.to_le_bytes())?;
+    f.write_all(&block_align.to_le_bytes())?;
+    f.write_all(&bits.to_le_bytes())?;
+    f.write_all(b"data")?;
+    f.write_all(&data_bytes.to_le_bytes())?;
+    for &s in samples {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        f.write_all(&v.to_le_bytes())?;
+    }
+    f.flush()
+}
+
 fn build_input(
     host: &cpal::Host,
     device_id: &str,
@@ -658,42 +841,85 @@ fn build_input(
     let supported = device.default_input_config().map_err(|e| e.to_string())?;
     let cfg: StreamConfig = supported.config();
     let in_ch = cfg.channels as usize;
+    let in_sr = cfg.sample_rate.0 as f32;
 
     let rb = HeapRb::<f32>::new(RING_FRAMES * 2);
     let (prod, cons) = rb.split();
     if let Some(node) = shared.nodes.lock().unwrap().get(node_id) {
         *node.consumer.lock().unwrap() = Some(cons);
+        node.primed.store(false, Ordering::Relaxed); // re-cushion on the new ring
     }
 
     let err = |e| eprintln!("[audio] input stream error: {e}");
     let stream = match supported.sample_format() {
-        SampleFormat::F32 => device.build_input_stream(&cfg, input_cb::<f32>(in_ch, prod, shared.clone()), err, None),
-        SampleFormat::I16 => device.build_input_stream(&cfg, input_cb::<i16>(in_ch, prod, shared.clone()), err, None),
-        SampleFormat::U16 => device.build_input_stream(&cfg, input_cb::<u16>(in_ch, prod, shared.clone()), err, None),
+        SampleFormat::F32 => device.build_input_stream(&cfg, input_cb::<f32>(in_ch, in_sr, prod, shared.clone()), err, None),
+        SampleFormat::I16 => device.build_input_stream(&cfg, input_cb::<i16>(in_ch, in_sr, prod, shared.clone()), err, None),
+        SampleFormat::U16 => device.build_input_stream(&cfg, input_cb::<u16>(in_ch, in_sr, prod, shared.clone()), err, None),
         f => return Err(format!("unsupported input sample format: {f:?}")),
     }
     .map_err(|e| e.to_string())?;
     Ok(stream)
 }
 
-fn input_cb<T>(in_ch: usize, mut prod: HeapProd<f32>, shared: Arc<Shared>) -> impl FnMut(&[T], &cpal::InputCallbackInfo)
+fn input_cb<T>(
+    in_ch: usize,
+    in_sr: f32,
+    mut prod: HeapProd<f32>,
+    shared: Arc<Shared>,
+) -> impl FnMut(&[T], &cpal::InputCallbackInfo)
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
     let in_ch = in_ch.max(1);
-    let mut stereo = vec![0f32; MAX_BLOCK_FRAMES * 2];
+    // Streaming linear-resampler state, converting the input device rate to the
+    // master (output) rate so the output callback can read the ring 1:1. When the
+    // rates already match this whole path is bypassed (byte-identical pass-through).
+    let mut prev_l = 0.0f32;
+    let mut prev_r = 0.0f32;
+    let mut pos = 0.0f32; // position (in input frames) of the next output sample
+    let mut out: Vec<f32> = Vec::with_capacity(MAX_BLOCK_FRAMES * 4);
     move |data: &[T], _| {
-        let frames = (data.len() / in_ch).min(MAX_BLOCK_FRAMES);
-        shared.in_frames.store(frames as u32, Ordering::Relaxed);
-        for i in 0..frames {
-            let base = i * in_ch;
-            let l = f32::from_sample(data[base]);
-            let r = if in_ch >= 2 { f32::from_sample(data[base + 1]) } else { l };
-            stereo[2 * i] = l;
-            stereo[2 * i + 1] = r;
+        let frames = data.len() / in_ch;
+        shared.in_frames.store(frames.min(MAX_BLOCK_FRAMES) as u32, Ordering::Relaxed);
+        let master = shared.sr.load(Ordering::Relaxed) as f32;
+
+        out.clear();
+        if master < 1.0 || (master - in_sr).abs() <= 0.5 {
+            // Matched rate (or master not yet known): interleave to stereo 1:1.
+            for i in 0..frames {
+                let base = i * in_ch;
+                let l = f32::from_sample(data[base]);
+                let r = if in_ch >= 2 { f32::from_sample(data[base + 1]) } else { l };
+                out.push(l);
+                out.push(r);
+            }
+            // Keep resampler continuity in case the rate diverges on a later block.
+            if frames > 0 {
+                let base = (frames - 1) * in_ch;
+                prev_l = f32::from_sample(data[base]);
+                prev_r = if in_ch >= 2 { f32::from_sample(data[base + 1]) } else { prev_l };
+            }
+            pos = 0.0;
+        } else {
+            // Resample input (in_sr) → master. `step` = input frames advanced per
+            // emitted output sample; >1 decimates, <1 interpolates.
+            let step = in_sr / master;
+            for i in 0..frames {
+                let base = i * in_ch;
+                let cur_l = f32::from_sample(data[base]);
+                let cur_r = if in_ch >= 2 { f32::from_sample(data[base + 1]) } else { cur_l };
+                while pos < 1.0 {
+                    out.push(prev_l + (cur_l - prev_l) * pos);
+                    out.push(prev_r + (cur_r - prev_r) * pos);
+                    pos += step;
+                }
+                pos -= 1.0;
+                prev_l = cur_l;
+                prev_r = cur_r;
+            }
         }
-        prod.push_slice(&stereo[..frames * 2]);
+        prod.push_slice(&out);
     }
 }
 
@@ -745,6 +971,17 @@ where
         let snap = shared.snapshot.load();
         cache.clear();
         let stereo = eval(&snap, &node_id, 0, frames, sr, &mut cache, 0);
+
+        // Drive recording recorders as extra roots (so they capture even when not
+        // routed to an output). Only the primary output does this, to avoid
+        // double-recording when several outputs run.
+        if snap.primary_output.as_deref() == Some(node_id.as_str()) {
+            for rid in &snap.recorders {
+                if snap.nodes.get(rid).map(|n| n.recording.load(Ordering::Relaxed)).unwrap_or(false) {
+                    let _ = eval(&snap, rid, 0, frames, sr, &mut cache, 0);
+                }
+            }
+        }
 
         for i in 0..frames {
             let l = stereo[2 * i];

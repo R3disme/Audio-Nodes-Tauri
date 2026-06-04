@@ -125,8 +125,13 @@ class NativeEngine implements AudioBackend {
     return () => set!.delete(cb)
   }
 
-  subscribeNodeChanges(_cb: () => void): () => void {
-    return () => {}
+  private nodeSubs = new Set<() => void>()
+  subscribeNodeChanges(cb: () => void): () => void {
+    this.nodeSubs.add(cb)
+    return () => { this.nodeSubs.delete(cb) }
+  }
+  private notifyNodeChanges(): void {
+    for (const cb of this.nodeSubs) cb()
   }
 
   getCompressorReduction(id: string, channel = 0): number {
@@ -170,16 +175,63 @@ class NativeEngine implements AudioBackend {
 
   async recoverInputs(): Promise<void> {}
 
+  // The renderer captures system audio with getDisplayMedia (proven, same as the
+  // Web Audio engine) and bridges the PCM into the native engine's loopback ring.
+  private appCaptures = new Map<string, {
+    ctx: AudioContext; stream: MediaStream; src: MediaStreamAudioSourceNode; proc: ScriptProcessorNode; gain: GainNode
+  }>()
+
   async createApplicationNode(id: string, _sourceId: string, _sourceName: string): Promise<void> {
-    // Per-app loopback capture lands in Phase 3; for now the node is a silent
-    // passthrough so the graph stays valid.
     window.api.audio.createNode(id, 'application', 1, '')
   }
 
-  async armApplicationCapture(_id: string, _sourceId: string, _sourceName: string): Promise<void> {}
+  async armApplicationCapture(id: string, sourceId: string, _sourceName: string): Promise<void> {
+    if (!sourceId) return
+    this.stopAppCapture(id)
+    try {
+      await window.api.armCaptureSource(sourceId)
+      const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
+      stream.getVideoTracks().forEach(t => t.stop())
+      const tracks = stream.getAudioTracks()
+      if (tracks.length === 0) return
+      const audioOnly = new MediaStream(tracks)
+      const ctx = new AudioContext()
+      const src = ctx.createMediaStreamSource(audioOnly)
+      // ScriptProcessor only runs while connected to a destination; a 0-gain node
+      // keeps it pumping without playing the captured audio back out the speakers.
+      const proc = ctx.createScriptProcessor(2048, 2, 1)
+      const gain = ctx.createGain()
+      gain.gain.value = 0
+      proc.onaudioprocess = (e): void => {
+        const inp = e.inputBuffer
+        const L = inp.getChannelData(0)
+        const R = inp.numberOfChannels > 1 ? inp.getChannelData(1) : L
+        const n = inp.length
+        const inter = new Float32Array(n * 2)
+        for (let i = 0; i < n; i++) { inter[2 * i] = L[i]; inter[2 * i + 1] = R[i] }
+        window.api.audio.pushCapture(id, inter)
+      }
+      src.connect(proc); proc.connect(gain); gain.connect(ctx.destination)
+      tracks[0].onended = () => { this.stopAppCapture(id) }
+      this.appCaptures.set(id, { ctx, stream: audioOnly, src, proc, gain })
+      this.notifyNodeChanges()
+    } catch (e) {
+      console.warn('[native engine] application capture failed:', e)
+    }
+  }
 
-  isApplicationActive(_id: string): boolean {
-    return false
+  private stopAppCapture(id: string): void {
+    const c = this.appCaptures.get(id)
+    if (!c) return
+    try { c.proc.onaudioprocess = null; c.proc.disconnect(); c.src.disconnect(); c.gain.disconnect() } catch { /* */ }
+    c.stream.getTracks().forEach(t => t.stop())
+    void c.ctx.close().catch(() => {})
+    this.appCaptures.delete(id)
+    this.notifyNodeChanges()
+  }
+
+  isApplicationActive(id: string): boolean {
+    return this.appCaptures.has(id)
   }
 
   // ── Output ──────────────────────────────────────────────────────────────
@@ -195,30 +247,32 @@ class NativeEngine implements AudioBackend {
   async recoverOutputs(): Promise<void> {}
 
   // ── Recorder ──────────────────────────────────────────────────────────────
-  // Capture-to-file is renderer-side (MediaRecorder) on the Web Audio engine.
-  // The native engine has no MediaStream to tap yet, so the node exists as a
-  // passthrough sink and recording is reported as unsupported.
+  // The engine taps the node's signal and writes a 16-bit WAV; on stop the main
+  // process reads the file back as bytes, which we wrap as a Blob so the same
+  // download/playback path as Web Audio works.
 
-  private warnedNoRec = false
+  private recording = new Set<string>()
 
   createRecorderNode(id: string): void {
     window.api.audio.createNode(id, 'recorder', 1, '')
   }
 
-  startRecording(_id: string): boolean {
-    if (!this.warnedNoRec) {
-      console.warn('[native engine] recording is not yet supported — switch to the Web Audio engine to record.')
-      this.warnedNoRec = true
-    }
-    return false
+  startRecording(id: string): boolean {
+    window.api.audio.startRecording(id)
+    this.recording.add(id)
+    return true
   }
 
-  async stopRecording(_id: string): Promise<{ blob: Blob; mimeType: string; extension: string } | null> {
-    return null
+  async stopRecording(id: string): Promise<{ blob: Blob; mimeType: string; extension: string } | null> {
+    this.recording.delete(id)
+    const res = await window.api.audio.stopRecording(id)
+    if (!res) return null
+    // `bytes` arrives as a Uint8Array over IPC; cast to satisfy the strict BlobPart type.
+    return { blob: new Blob([res.bytes as BlobPart], { type: res.mime }), mimeType: res.mime, extension: res.ext }
   }
 
-  isRecording(_id: string): boolean {
-    return false
+  isRecording(id: string): boolean {
+    return this.recording.has(id)
   }
 
   // ── File player ───────────────────────────────────────────────────────────
@@ -456,6 +510,8 @@ class NativeEngine implements AudioBackend {
   }
 
   destroyNode(id: string): void {
+    this.stopAppCapture(id)
+    this.recording.delete(id)
     this.connections = this.connections.filter((c) => c.source !== id && c.target !== id)
     this.gains.delete(id)
     this.mutes.delete(id)

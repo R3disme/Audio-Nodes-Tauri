@@ -1,5 +1,6 @@
 import { app, shell, BrowserWindow, ipcMain, desktopCapturer, session, Tray, Menu, nativeImage } from 'electron'
 import { join } from 'path'
+import { readFile, unlink } from 'node:fs/promises'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { TRAY_ICON_DATA_URL } from './trayIcon'
 
@@ -65,6 +66,9 @@ interface NativeAudioEngineInstance {
   destroyNode(id: string): void
   meters(): Record<string, number>
   latencyMs(): number
+  startRecording(id: string): boolean
+  stopRecording(id: string): string | null
+  pushCapture(id: string, samples: Float32Array): void
 }
 interface NativeAudioModule {
   version(): string
@@ -225,6 +229,25 @@ app.whenReady().then(() => {
     const engine = await getNativeEngine()
     return engine ? engine.latencyMs() : 0
   })
+  ipcMain.on('audio:start-recording', (_e, id: string) =>
+    withEngine((e) => e.startRecording(id)))
+  // High-rate: PCM blocks captured in the renderer (getDisplayMedia) → engine ring.
+  ipcMain.on('audio:push-capture', (_e, id: string, samples: Float32Array) =>
+    withEngine((e) => e.pushCapture(id, samples)))
+  // Stop → the engine writes a temp WAV; read it back as bytes for the renderer
+  // (so the same download/playback path as Web Audio works), then delete it.
+  ipcMain.handle('audio:stop-recording', async (_e, id: string) => {
+    const engine = await getNativeEngine()
+    const path = engine ? engine.stopRecording(id) : null
+    if (!path) return null
+    try {
+      const bytes = await readFile(path)
+      void unlink(path).catch(() => {})
+      return { bytes, ext: 'wav', mime: 'audio/wav' }
+    } catch {
+      return null
+    }
+  })
 
   // Graph control — one-way; resolve the engine then apply.
   const withEngine = (fn: (e: NativeAudioEngineInstance) => void): void => {
@@ -254,7 +277,12 @@ app.whenReady().then(() => {
       return
     }
     const sources = await desktopCapturer.getSources({ types: ['window', 'screen'] })
+    // The chosen window may be minimized or closed (Windows won't enumerate it for
+    // capture). Audio here is system loopback regardless of the video source, so
+    // fall back to a screen source to keep the audio flowing instead of failing.
     const source = sources.find(s => s.id === pendingCaptureSourceId)
+      ?? sources.find(s => s.id.startsWith('screen:'))
+      ?? sources[0]
     pendingCaptureSourceId = null
     if (source) {
       callback({ video: source, audio: 'loopback' })

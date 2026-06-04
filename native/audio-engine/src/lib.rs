@@ -12,6 +12,7 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 use cpal::traits::{DeviceTrait, HostTrait};
+use napi::bindgen_prelude::Float32Array;
 use napi_derive::napi;
 use std::collections::HashMap;
 
@@ -178,6 +179,24 @@ impl NativeAudioEngine {
     #[napi]
     pub fn latency_ms(&self) -> f64 {
         self.engine.latency_ms()
+    }
+
+    /// Arm a recorder node. Returns false if the id isn't a recorder.
+    #[napi]
+    pub fn start_recording(&self, id: String) -> bool {
+        self.engine.start_recording(&id)
+    }
+
+    /// Stop a recorder and return the path of the written WAV file (or null).
+    #[napi]
+    pub fn stop_recording(&self, id: String) -> Option<String> {
+        self.engine.stop_recording(&id)
+    }
+
+    /// Feed captured PCM (interleaved stereo f32) into an application/loopback node.
+    #[napi]
+    pub fn push_capture(&self, id: String, samples: Float32Array) {
+        self.engine.push_capture(&id, samples.as_ref());
     }
 
     // ── Device enumeration ─────────────────────────────────────────────────

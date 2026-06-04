@@ -11,7 +11,7 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 import { DEFAULT_NODE_COLORS, NODE_TYPE_ORDER, darken } from './nodeColors'
-import { hexToHsl, hslToHex, clamp, vibrancy, paletteFromImage } from './color'
+import { hexToHsl, hslToHex, clamp, vibrancy, paletteFromImage, downscaleDataUrl } from './color'
 
 export type ThemeMode = 'simple' | 'advanced' | 'picture'
 
@@ -106,7 +106,10 @@ export function deriveSimple(accent: string, base?: Partial<Theme>): Theme {
 
 /** Build a theme (and node palette) from an image, keeping it as the background. */
 export async function themeFromImage(dataUrl: string): Promise<Theme> {
-  const palette = await paletteFromImage(dataUrl, NODE_TYPE_ORDER.length)
+  // Shrink first so the image both samples fast and fits localStorage as the
+  // persisted background.
+  const img = await downscaleDataUrl(dataUrl)
+  const palette = await paletteFromImage(img, NODE_TYPE_ORDER.length)
   const accent = [...palette].sort((a, b) => vibrancy(b) - vibrancy(a))[0] ?? DEFAULT_THEME.accent
 
   const chrome = deriveSimple(accent)
@@ -119,7 +122,7 @@ export async function themeFromImage(dataUrl: string): Promise<Theme> {
     ...chrome,
     mode: 'picture',
     nodes,
-    backgroundImage: dataUrl,
+    backgroundImage: img,
     backgroundImageEnabled: true,
     backgroundImageOpacity: 0.32
   }

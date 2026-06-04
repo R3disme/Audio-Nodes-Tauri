@@ -125,3 +125,27 @@ function loadImage(src: string): Promise<HTMLImageElement> {
     img.src = src
   })
 }
+
+/**
+ * Re-encode a (possibly huge) image data URL onto a bounded canvas as JPEG, so a
+ * photo used as a theme/background fits in localStorage and persists across runs.
+ * Returns the original if it's already small or can't be processed.
+ */
+export async function downscaleDataUrl(dataUrl: string, maxDim = 1600, quality = 0.85): Promise<string> {
+  try {
+    const img = await loadImage(dataUrl)
+    const scale = Math.min(1, maxDim / Math.max(img.width, img.height))
+    if (scale >= 1 && dataUrl.length < 400_000) return dataUrl
+    const w = Math.max(1, Math.round(img.width * scale))
+    const h = Math.max(1, Math.round(img.height * scale))
+    const canvas = document.createElement('canvas')
+    canvas.width = w
+    canvas.height = h
+    const ctx = canvas.getContext('2d')
+    if (!ctx) return dataUrl
+    ctx.drawImage(img, 0, 0, w, h)
+    return canvas.toDataURL('image/jpeg', quality)
+  } catch {
+    return dataUrl
+  }
+}
