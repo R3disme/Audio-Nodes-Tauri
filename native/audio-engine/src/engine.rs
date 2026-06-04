@@ -49,14 +49,37 @@ const MAX_BLOCK_FRAMES: usize = 8192;
 const RING_FRAMES: usize = 48_000; // ~1s of stereo headroom
 const MAX_DEPTH: u32 = 64; // graph-recursion / cycle guard
 
-// Input/loopback latency cushion. The capture ring is read only once a cushion of
-// this many frames has built up, so ordinary jitter between the (independent)
-// capture and render device callbacks can't drain it to silence — that empty-ring
-// underrun is what produced the constant crackle / "not smooth" sound. If slow
-// clock drift grows the cushion past MAX, we drop back down to TARGET to keep
-// latency bounded; if it ever runs dry, we re-prime.
-const TARGET_LATENCY_FRAMES: usize = 1536; // ~32 ms @48k — absorbs callback jitter
-const MAX_LATENCY_FRAMES: usize = 12_288; // ~256 ms — cap before re-centering
+// Input/loopback latency cushion. The capture ring is read only once a cushion has
+// built up, so ordinary jitter between the (independent) capture and render device
+// callbacks can't drain it to silence — that empty-ring underrun is what produced the
+// constant crackle / "not smooth" sound. If slow clock drift grows the cushion past the
+// max, we drop back down to target to keep latency bounded; if it ever runs dry, we
+// re-prime.
+//
+// The cushion is *derived at runtime* (see `cushion_frames`) from the live device
+// callback block sizes rather than hardcoded, so it scales with the actual buffer sizes
+// and sample rate instead of assuming 48k.
+const CUSHION_BLOCKS: u32 = 3; // ~3 callback periods of jitter headroom
+const CUSHION_FLOOR_MS: f32 = 12.0; // minimum cushion regardless of block size
+const MAX_LATENCY_MS: f32 = 256.0; // drift cap before re-centering the cushion
+
+/// Target input/loopback cushion in **mono frames**, derived from the live device block
+/// sizes (`in_frames`/`out_frames`) and sample rate. `max(in, out)` tracks whichever side
+/// jitters more and stays sane when there's no input stream; the floor keeps small-buffer
+/// devices protected and covers the window before the first input block lands. 0 until a
+/// stream is running (sr known).
+fn cushion_frames(shared: &Shared) -> u32 {
+    let sr = shared.sr.load(Ordering::Relaxed);
+    if sr == 0 {
+        return 0;
+    }
+    let block = shared
+        .in_frames
+        .load(Ordering::Relaxed)
+        .max(shared.out_frames.load(Ordering::Relaxed));
+    let floor = (sr as f32 * CUSHION_FLOOR_MS / 1000.0) as u32;
+    (CUSHION_BLOCKS * block).max(floor)
+}
 
 // ── Meters (lock-free f32 in an AtomicU32) ──────────────────────────────────
 
@@ -363,9 +386,18 @@ impl Engine {
         if sr == 0 {
             return 0.0;
         }
-        let frames = self.shared.in_frames.load(Ordering::Relaxed)
-            + self.shared.out_frames.load(Ordering::Relaxed)
-            + TARGET_LATENCY_FRAMES as u32; // the input cushion is real latency too
+        let inf = self.shared.in_frames.load(Ordering::Relaxed);
+        let outf = self.shared.out_frames.load(Ordering::Relaxed);
+        let cush = cushion_frames(&self.shared); // the input cushion is real latency too
+        let frames = inf + outf + cush;
+        // TEMP diagnostic: see which term dominates the reported latency.
+        eprintln!(
+            "[latency] sr={sr} in={inf}f ({:.1}ms) out={outf}f ({:.1}ms) cushion={cush}f ({:.1}ms) total={:.0}ms",
+            inf as f64 / sr as f64 * 1000.0,
+            outf as f64 / sr as f64 * 1000.0,
+            cush as f64 / sr as f64 * 1000.0,
+            frames as f64 / sr as f64 * 1000.0,
+        );
         (frames as f64 / sr as f64 * 1000.0).round()
     }
 
@@ -613,6 +645,7 @@ fn eval(
     ch: usize,
     frames: usize,
     sr: f32,
+    cushion: u32,
     cache: &mut HashMap<String, Vec<f32>>,
     depth: u32,
 ) -> Vec<f32> {
@@ -633,8 +666,8 @@ fn eval(
         {
             let mut guard = node.consumer.lock().unwrap();
             if let Some(cons) = guard.as_mut() {
-                let target = TARGET_LATENCY_FRAMES * 2;
-                let max = MAX_LATENCY_FRAMES * 2;
+                let target = cushion as usize * 2;
+                let max = (sr * MAX_LATENCY_MS / 1000.0) as usize * 2;
                 let avail = cons.occupied_len();
                 // Build the cushion before the first read so jitter can't underrun.
                 if !node.primed.load(Ordering::Relaxed) && avail >= target + n {
@@ -676,7 +709,7 @@ fn eval(
     if node.kind == Kind::Mixer {
         // Every input channel folds into the single output, each with its gain.
         for e in incoming.iter() {
-            let up = eval(snap, &e.src, e.src_ch, frames, sr, cache, depth + 1);
+            let up = eval(snap, &e.src, e.src_ch, frames, sr, cushion, cache, depth + 1);
             let g = node
                 .mixer_gains
                 .get(e.tgt_ch)
@@ -700,7 +733,7 @@ fn eval(
 
     // Sum every upstream feeding this output channel (Web Audio summing semantics).
     for e in incoming.iter().filter(|e| e.tgt_ch == ch) {
-        let up = eval(snap, &e.src, e.src_ch, frames, sr, cache, depth + 1);
+        let up = eval(snap, &e.src, e.src_ch, frames, sr, cushion, cache, depth + 1);
         for i in 0..n {
             acc[i] += up[i];
         }
@@ -968,9 +1001,10 @@ where
         let frames = (data.len() / out_ch).min(MAX_BLOCK_FRAMES);
         shared.out_frames.store(frames as u32, Ordering::Relaxed);
         shared.sr.store(sr as u32, Ordering::Relaxed);
+        let cushion = cushion_frames(&shared);
         let snap = shared.snapshot.load();
         cache.clear();
-        let stereo = eval(&snap, &node_id, 0, frames, sr, &mut cache, 0);
+        let stereo = eval(&snap, &node_id, 0, frames, sr, cushion, &mut cache, 0);
 
         // Drive recording recorders as extra roots (so they capture even when not
         // routed to an output). Only the primary output does this, to avoid
@@ -978,7 +1012,7 @@ where
         if snap.primary_output.as_deref() == Some(node_id.as_str()) {
             for rid in &snap.recorders {
                 if snap.nodes.get(rid).map(|n| n.recording.load(Ordering::Relaxed)).unwrap_or(false) {
-                    let _ = eval(&snap, rid, 0, frames, sr, &mut cache, 0);
+                    let _ = eval(&snap, rid, 0, frames, sr, cushion, &mut cache, 0);
                 }
             }
         }
