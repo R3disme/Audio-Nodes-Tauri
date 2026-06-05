@@ -136,7 +136,7 @@ src/
   preload/     Context-isolated IPC bridge
   renderer/src/
     audio/        AudioEngine (Web Audio) + NativeEngine (Rust IPC) behind an AudioBackend seam
-    components/   Toolbar, Sidebar, WorkspaceBar, NodeEditor, ThemePanel, VU meters, nodes/
+    components/   Toolbar, Sidebar, WorkspaceBar, NodeEditor, SettingsPanel, VU meters, nodes/
     lib/          color/theme math, node colors, persistence
     store/        Zustand stores (audio graph + workspaces, settings/theme)
 native/

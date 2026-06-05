@@ -53,32 +53,57 @@ const MAX_DEPTH: u32 = 64; // graph-recursion / cycle guard
 // built up, so ordinary jitter between the (independent) capture and render device
 // callbacks can't drain it to silence — that empty-ring underrun is what produced the
 // constant crackle / "not smooth" sound. If slow clock drift grows the cushion past the
-// max, we drop back down to target to keep latency bounded; if it ever runs dry, we
+// drift cap, we drop back down to target to keep latency bounded; if it ever runs dry, we
 // re-prime.
 //
-// The cushion is *derived at runtime* (see `cushion_frames`) from the live device
-// callback block sizes rather than hardcoded, so it scales with the actual buffer sizes
-// and sample rate instead of assuming 48k.
-const CUSHION_BLOCKS: u32 = 3; // ~3 callback periods of jitter headroom
-const CUSHION_FLOOR_MS: f32 = 12.0; // minimum cushion regardless of block size
-const MAX_LATENCY_MS: f32 = 256.0; // drift cap before re-centering the cushion
+// Sizing model: **one device block** (the worst-case phase offset between a whole-block
+// capture push and a whole-block render pop) plus an *adaptive* jitter margin per input.
+// The margin **self-tunes**: an underrun bumps it up by `STEP_UP_MS` (immediately buying
+// headroom), and a long stretch of clean reads decays it down by `STEP_DOWN_MS` toward the
+// floor — so latency settles at the smallest margin the real device/system jitter tolerates
+// instead of a hardcoded guess. The floor/ceiling come from the user's latency mode
+// (`min_margin_ms`/`max_margin_ms` on `Shared`, set by `set_latency_mode`).
+const STEP_UP_MS: f32 = 6.0; // margin growth per underrun
+const STEP_DOWN_MS: f32 = 1.0; // margin decay per stable interval
+const CLEAN_DECAY_SECS: f32 = 5.0; // clean-read stretch before one decay step
+const DRIFT_MARGIN_MS: f32 = 20.0; // how far past target the ring may drift before re-centering
+// Default latency-mode bounds (balanced) until `set_latency_mode` is called.
+const DEFAULT_MIN_MARGIN_MS: f32 = 8.0;
+const DEFAULT_MAX_MARGIN_MS: f32 = 60.0;
 
-/// Target input/loopback cushion in **mono frames**, derived from the live device block
-/// sizes (`in_frames`/`out_frames`) and sample rate. `max(in, out)` tracks whichever side
-/// jitters more and stays sane when there's no input stream; the floor keeps small-buffer
-/// devices protected and covers the window before the first input block lands. 0 until a
-/// stream is running (sr known).
-fn cushion_frames(shared: &Shared) -> u32 {
-    let sr = shared.sr.load(Ordering::Relaxed);
-    if sr == 0 {
-        return 0;
+/// Per-block cushion parameters, computed once in the output callback and threaded into
+/// `eval`. All margins in **ms**; `block` in mono frames (`max(in, out)` device block).
+#[derive(Clone, Copy)]
+struct CushionCfg {
+    block: usize,
+    min_ms: f32,
+    max_ms: f32,
+    /// Clean reads required before the adaptive margin decays one `STEP_DOWN_MS`.
+    decay_blocks: u32,
+}
+
+/// Map a latency-mode name to `(min_margin_ms, max_margin_ms)`. Unknown → balanced.
+fn latency_mode_bounds(mode: &str) -> (f32, f32) {
+    match mode {
+        "low" => (3.0, 40.0),
+        "safe" => (18.0, 120.0),
+        _ => (DEFAULT_MIN_MARGIN_MS, DEFAULT_MAX_MARGIN_MS), // "balanced"
     }
-    let block = shared
-        .in_frames
-        .load(Ordering::Relaxed)
-        .max(shared.out_frames.load(Ordering::Relaxed));
-    let floor = (sr as f32 * CUSHION_FLOOR_MS / 1000.0) as u32;
-    (CUSHION_BLOCKS * block).max(floor)
+}
+
+/// Median of `xs` (mutates by sorting). Empty → 0.0. Even count → mean of the two
+/// middle values.
+fn median(xs: &mut [f32]) -> f32 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = xs.len() / 2;
+    if xs.len() % 2 == 1 {
+        xs[mid]
+    } else {
+        (xs[mid - 1] + xs[mid]) * 0.5
+    }
 }
 
 // ── Meters (lock-free f32 in an AtomicU32) ──────────────────────────────────
@@ -208,6 +233,20 @@ pub struct NodeState {
     /// accumulator (appended by the audio thread, drained → WAV on stop).
     recording: AtomicBool,
     rec_buf: Mutex<Vec<f32>>,
+    /// Measured device latency in **ms** (f32 bits): input nodes store the real
+    /// capture→callback age (cpal QPC timestamps), output nodes the playback buffer
+    /// depth. 0 for non-I/O nodes / before the stream runs. Feeds the live latency
+    /// readout (not the cushion).
+    dev_latency: AtomicU32,
+    /// Input/loopback only: the ring occupancy (mono frames) measured at the last read
+    /// in `eval` — the *real* in-flight cushion, which drifts, unlike the nominal target.
+    ring_frames: AtomicU32,
+    /// Input/loopback only: the self-tuning cushion margin (ms, f32 bits) on top of one
+    /// device block — grown on underrun, decayed when stable, clamped to the mode bounds.
+    adapt_margin: AtomicU32,
+    /// Input/loopback only: consecutive clean (non-underrun) reads since the last decay,
+    /// driving the slow margin decay back toward the floor.
+    clean_blocks: AtomicU32,
 }
 
 impl NodeState {
@@ -276,6 +315,9 @@ struct Shared {
     in_frames: AtomicU32,
     out_frames: AtomicU32,
     sr: AtomicU32,
+    // Adaptive-cushion margin bounds (ms, f32 bits), set by `set_latency_mode`.
+    min_margin_ms: AtomicU32,
+    max_margin_ms: AtomicU32,
 }
 
 pub struct Engine {
@@ -292,6 +334,8 @@ impl Engine {
             in_frames: AtomicU32::new(0),
             out_frames: AtomicU32::new(0),
             sr: AtomicU32::new(0),
+            min_margin_ms: AtomicU32::new(DEFAULT_MIN_MARGIN_MS.to_bits()),
+            max_margin_ms: AtomicU32::new(DEFAULT_MAX_MARGIN_MS.to_bits()),
         });
         let (tx, rx) = channel::<Command>();
         let thread_shared = shared.clone();
@@ -357,6 +401,10 @@ impl Engine {
             reduction,
             recording: AtomicBool::new(false),
             rec_buf: Mutex::new(Vec::new()),
+            dev_latency: AtomicU32::new(0f32.to_bits()),
+            ring_frames: AtomicU32::new(0),
+            adapt_margin: AtomicU32::new(DEFAULT_MIN_MARGIN_MS.to_bits()),
+            clean_blocks: AtomicU32::new(0),
         });
 
         self.shared.nodes.lock().unwrap().insert(id.to_string(), node);
@@ -367,38 +415,52 @@ impl Engine {
                     device_id: device_id.to_string(),
                 });
             }
-            Kind::Output => {
-                let _ = self.tx.send(Command::CreateOutputStream {
-                    id: id.to_string(),
-                    device_id: device_id.to_string(),
-                });
-            }
+            // Output streams are NOT auto-opened — the renderer opens them explicitly via
+            // `set_output_device` (regular Output uses "" ⇒ default; Virtual Output only
+            // opens for a real cable, so a device-less Virtual Output stays silent instead
+            // of grabbing the default device and contending with the Output node).
             _ => {}
         }
         self.recompute();
     }
 
-    /// Rough input→output latency estimate (ms) from the live device buffer
-    /// sizes. 0 until streams are running. (Shared-mode WASAPI is typically a few
-    /// tens of ms; this is an estimate, not a guarantee.)
+    /// Set the adaptive-cushion margin bounds from a latency-mode name
+    /// (`"low"`/`"balanced"`/`"safe"`). Applied live — per-input margins re-clamp into
+    /// the new bounds on the next block, no stream rebuild needed.
+    pub fn set_latency_mode(&self, mode: &str) {
+        let (min_ms, max_ms) = latency_mode_bounds(mode);
+        self.shared.min_margin_ms.store(min_ms.to_bits(), Ordering::Relaxed);
+        self.shared.max_margin_ms.store(max_ms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Measured input→output audio latency (ms). Per device, latency is the real
+    /// capture/playback buffer depth reported by cpal's QPC timestamps plus, on the
+    /// input side, the *measured* ring occupancy (the live cushion in flight). With
+    /// several inputs/outputs we report `median(inputs) + median(outputs)` — a
+    /// representative path rather than the sum of all devices. 0 until streams run.
+    ///
+    /// Note: plain effect nodes (EQ/comp/gate/…) add no latency in this pull-based
+    /// graph — each block is processed in place — so only Delay/Reverb/Chorus (which
+    /// buffer on purpose) and the device/ring buffering move this number.
     pub fn latency_ms(&self) -> f64 {
-        let sr = self.shared.sr.load(Ordering::Relaxed);
-        if sr == 0 {
+        let sr = self.shared.sr.load(Ordering::Relaxed) as f32;
+        if sr < 1.0 {
             return 0.0;
         }
-        let inf = self.shared.in_frames.load(Ordering::Relaxed);
-        let outf = self.shared.out_frames.load(Ordering::Relaxed);
-        let cush = cushion_frames(&self.shared); // the input cushion is real latency too
-        let frames = inf + outf + cush;
-        // TEMP diagnostic: see which term dominates the reported latency.
-        eprintln!(
-            "[latency] sr={sr} in={inf}f ({:.1}ms) out={outf}f ({:.1}ms) cushion={cush}f ({:.1}ms) total={:.0}ms",
-            inf as f64 / sr as f64 * 1000.0,
-            outf as f64 / sr as f64 * 1000.0,
-            cush as f64 / sr as f64 * 1000.0,
-            frames as f64 / sr as f64 * 1000.0,
-        );
-        (frames as f64 / sr as f64 * 1000.0).round()
+        let mut inputs: Vec<f32> = Vec::new();
+        let mut outputs: Vec<f32> = Vec::new();
+        for node in self.shared.nodes.lock().unwrap().values() {
+            let dev = f32::from_bits(node.dev_latency.load(Ordering::Relaxed));
+            match node.kind {
+                Kind::Input | Kind::Loopback => {
+                    let ring = node.ring_frames.load(Ordering::Relaxed) as f32 / sr * 1000.0;
+                    inputs.push(dev + ring);
+                }
+                Kind::Output => outputs.push(dev),
+                _ => {}
+            }
+        }
+        (median(&mut inputs) + median(&mut outputs)).round() as f64
     }
 
     pub fn set_input_device(&self, id: &str, device_id: &str) {
@@ -636,47 +698,123 @@ fn drop_samples(cons: &mut HeapCons<f32>, count: usize) {
     }
 }
 
-/// Evaluate node `id`, output channel `ch`, into a fresh interleaved-stereo block
-/// of `frames * 2` samples. `cache` pops each input exactly once per block so a
-/// fan-out from one input within this output's graph stays correct.
+/// Per-callback scratch shared by `eval`: a buffer **pool** reused across blocks plus
+/// the input/loopback "pop once per block" cache. Heap allocation on the audio thread
+/// (a fresh `Vec` per node every block) was the dropout source — with the pool, `eval`
+/// allocates nothing in steady state. The cache tags each entry with a per-block
+/// `generation` so a fan-out within one block reuses the already-popped (and gained) data.
+struct EvalState {
+    /// Free interleaved-stereo buffers; `take` pops one (reusing its capacity), `give`
+    /// returns it. Grows only during warmup, then recycles.
+    pool: Vec<Vec<f32>>,
+    /// `id -> (generation, popped+gained input block)`. Owned separately from the pool so
+    /// it survives the whole block for fan-out.
+    cache: HashMap<String, (u64, Vec<f32>)>,
+    generation: u64,
+}
+
+impl EvalState {
+    fn new() -> Self {
+        EvalState { pool: Vec::new(), cache: HashMap::new(), generation: 0 }
+    }
+    /// Start a new callback block: bump the generation so last block's cache entries read
+    /// as stale (the first use of each input this block does a fresh ring pop).
+    fn begin_block(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+    }
+    /// Borrow a zeroed `n`-sample buffer (reuses a pooled allocation when available).
+    fn take(&mut self, n: usize) -> Vec<f32> {
+        let mut b = self.pool.pop().unwrap_or_default();
+        b.clear();
+        b.resize(n, 0.0);
+        b
+    }
+    /// Return a buffer to the pool for reuse next time.
+    fn give(&mut self, b: Vec<f32>) {
+        self.pool.push(b);
+    }
+    /// Whether `id` has a cache entry from the current block.
+    fn cache_fresh(&self, id: &str) -> bool {
+        matches!(self.cache.get(id), Some((g, _)) if *g == self.generation)
+    }
+    /// Store `src` as this block's cached value for `id` (reuses the entry's capacity).
+    fn cache_store(&mut self, id: &str, src: &[f32]) {
+        let g = self.generation;
+        match self.cache.get_mut(id) {
+            Some((cg, buf)) => {
+                *cg = g;
+                buf.clear();
+                buf.extend_from_slice(src);
+            }
+            None => {
+                self.cache.insert(id.to_string(), (g, src.to_vec()));
+            }
+        }
+    }
+}
+
+/// Evaluate node `id`, output channel `ch`, into an interleaved-stereo block of
+/// `frames * 2` samples drawn from `st`'s buffer pool. `st.cache` pops each input exactly
+/// once per block so a fan-out from one input within this output's graph stays correct.
 fn eval(
     snap: &GraphSnapshot,
     id: &str,
     ch: usize,
     frames: usize,
     sr: f32,
-    cushion: u32,
-    cache: &mut HashMap<String, Vec<f32>>,
+    cfg: CushionCfg,
+    st: &mut EvalState,
     depth: u32,
 ) -> Vec<f32> {
     let n = frames * 2;
     let Some(node) = snap.nodes.get(id) else {
-        return vec![0.0; n];
+        return st.take(n);
     };
     if depth > MAX_DEPTH {
-        return vec![0.0; n];
+        return st.take(n);
     }
 
     // Input / loopback node: pop the capture ring (once per block), gain + meter.
     if node.kind == Kind::Input || node.kind == Kind::Loopback {
-        if let Some(cached) = cache.get(id) {
-            return cached.clone();
+        // Fan-out within this block: reuse the already-popped (and gained) data so the
+        // ring is consumed exactly once.
+        if st.cache_fresh(id) {
+            let mut out = st.take(n);
+            if let Some((_, cached)) = st.cache.get(id) {
+                let m = n.min(cached.len());
+                out[..m].copy_from_slice(&cached[..m]);
+            }
+            return out;
         }
-        let mut b = vec![0.0f32; n];
+        let mut b = st.take(n);
         {
             let mut guard = node.consumer.lock().unwrap();
             if let Some(cons) = guard.as_mut() {
-                let target = cushion as usize * 2;
-                let max = (sr * MAX_LATENCY_MS / 1000.0) as usize * 2;
+                // Adaptive margin (ms) on top of one device block, clamped to the live
+                // latency-mode bounds. target = (block + margin) frames, interleaved-stereo.
+                let mut margin_ms =
+                    f32::from_bits(node.adapt_margin.load(Ordering::Relaxed)).clamp(cfg.min_ms, cfg.max_ms);
+                let margin_frames = (sr * margin_ms / 1000.0) as usize;
+                let target = (cfg.block + margin_frames) * 2;
+                // Re-center cap tracks the target: allow a fixed drift margin above it
+                // before trimming back, so steady-state latency stays near target instead
+                // of accumulating delay from slow clock drift.
+                let max = target + (sr * DRIFT_MARGIN_MS / 1000.0) as usize * 2;
                 let avail = cons.occupied_len();
+                // Real in-flight latency for the readout (interleaved-stereo → mono frames).
+                node.ring_frames.store((avail / 2) as u32, Ordering::Relaxed);
                 // Build the cushion before the first read so jitter can't underrun.
                 if !node.primed.load(Ordering::Relaxed) && avail >= target + n {
                     node.primed.store(true, Ordering::Relaxed);
                 }
                 if node.primed.load(Ordering::Relaxed) {
                     if avail < n {
-                        // Ran dry → emit silence (b stays zero) and re-prime.
+                        // Ran dry → emit silence (b stays zero), grow the margin (buy
+                        // headroom against this jitter), and re-prime to the new target.
                         node.primed.store(false, Ordering::Relaxed);
+                        margin_ms = (margin_ms + STEP_UP_MS).min(cfg.max_ms);
+                        node.adapt_margin.store(margin_ms.to_bits(), Ordering::Relaxed);
+                        node.clean_blocks.store(0, Ordering::Relaxed);
                     } else {
                         // Slow clock drift grew the cushion → drop back to target so
                         // latency stays bounded instead of accumulating delay.
@@ -684,6 +822,13 @@ fn eval(
                             drop_samples(cons, avail - target);
                         }
                         cons.pop_slice(&mut b);
+                        // Clean read: after a long stable stretch, decay the margin one
+                        // step toward the floor so latency creeps to the safe minimum.
+                        if node.clean_blocks.fetch_add(1, Ordering::Relaxed) + 1 >= cfg.decay_blocks {
+                            margin_ms = (margin_ms - STEP_DOWN_MS).max(cfg.min_ms);
+                            node.adapt_margin.store(margin_ms.to_bits(), Ordering::Relaxed);
+                            node.clean_blocks.store(0, Ordering::Relaxed);
+                        }
                     }
                 }
             }
@@ -697,19 +842,19 @@ fn eval(
         if let Some(m) = node.meters.first() {
             m.set(rms_to_db(rms(&b)));
         }
-        cache.insert(id.to_string(), b.clone());
+        st.cache_store(id, &b);
         return b;
     }
 
     let empty: Vec<Edge> = Vec::new();
     let incoming = snap.incoming.get(id).unwrap_or(&empty);
 
-    let mut acc = vec![0.0f32; n];
+    let mut acc = st.take(n);
 
     if node.kind == Kind::Mixer {
         // Every input channel folds into the single output, each with its gain.
         for e in incoming.iter() {
-            let up = eval(snap, &e.src, e.src_ch, frames, sr, cushion, cache, depth + 1);
+            let up = eval(snap, &e.src, e.src_ch, frames, sr, cfg, st, depth + 1);
             let g = node
                 .mixer_gains
                 .get(e.tgt_ch)
@@ -718,6 +863,7 @@ fn eval(
             for i in 0..n {
                 acc[i] += up[i] * g;
             }
+            st.give(up);
         }
         let m = node.gain_lin();
         if m != 1.0 {
@@ -733,10 +879,11 @@ fn eval(
 
     // Sum every upstream feeding this output channel (Web Audio summing semantics).
     for e in incoming.iter().filter(|e| e.tgt_ch == ch) {
-        let up = eval(snap, &e.src, e.src_ch, frames, sr, cushion, cache, depth + 1);
+        let up = eval(snap, &e.src, e.src_ch, frames, sr, cfg, st, depth + 1);
         for i in 0..n {
             acc[i] += up[i];
         }
+        st.give(up);
     }
 
     match node.kind {
@@ -878,16 +1025,17 @@ fn build_input(
 
     let rb = HeapRb::<f32>::new(RING_FRAMES * 2);
     let (prod, cons) = rb.split();
-    if let Some(node) = shared.nodes.lock().unwrap().get(node_id) {
+    let node = shared.nodes.lock().unwrap().get(node_id).cloned();
+    if let Some(node) = &node {
         *node.consumer.lock().unwrap() = Some(cons);
         node.primed.store(false, Ordering::Relaxed); // re-cushion on the new ring
     }
 
     let err = |e| eprintln!("[audio] input stream error: {e}");
     let stream = match supported.sample_format() {
-        SampleFormat::F32 => device.build_input_stream(&cfg, input_cb::<f32>(in_ch, in_sr, prod, shared.clone()), err, None),
-        SampleFormat::I16 => device.build_input_stream(&cfg, input_cb::<i16>(in_ch, in_sr, prod, shared.clone()), err, None),
-        SampleFormat::U16 => device.build_input_stream(&cfg, input_cb::<u16>(in_ch, in_sr, prod, shared.clone()), err, None),
+        SampleFormat::F32 => device.build_input_stream(&cfg, input_cb::<f32>(in_ch, in_sr, prod, shared.clone(), node.clone()), err, None),
+        SampleFormat::I16 => device.build_input_stream(&cfg, input_cb::<i16>(in_ch, in_sr, prod, shared.clone(), node.clone()), err, None),
+        SampleFormat::U16 => device.build_input_stream(&cfg, input_cb::<u16>(in_ch, in_sr, prod, shared.clone(), node), err, None),
         f => return Err(format!("unsupported input sample format: {f:?}")),
     }
     .map_err(|e| e.to_string())?;
@@ -899,6 +1047,7 @@ fn input_cb<T>(
     in_sr: f32,
     mut prod: HeapProd<f32>,
     shared: Arc<Shared>,
+    node: Option<Arc<NodeState>>,
 ) -> impl FnMut(&[T], &cpal::InputCallbackInfo)
 where
     T: SizedSample,
@@ -912,10 +1061,22 @@ where
     let mut prev_r = 0.0f32;
     let mut pos = 0.0f32; // position (in input frames) of the next output sample
     let mut out: Vec<f32> = Vec::with_capacity(MAX_BLOCK_FRAMES * 4);
-    move |data: &[T], _| {
+    move |data: &[T], info: &cpal::InputCallbackInfo| {
         let frames = data.len() / in_ch;
         shared.in_frames.store(frames.min(MAX_BLOCK_FRAMES) as u32, Ordering::Relaxed);
         let master = shared.sr.load(Ordering::Relaxed) as f32;
+
+        // Real input device latency: how long ago this block was captured (cpal QPC
+        // capture→callback). Falls back to the block size if the platform reports none.
+        if let Some(node) = &node {
+            let ts = info.timestamp();
+            let dev_ms = ts
+                .callback
+                .duration_since(&ts.capture)
+                .map(|d| d.as_secs_f32() * 1000.0)
+                .unwrap_or(frames as f32 / in_sr * 1000.0);
+            node.dev_latency.store(dev_ms.to_bits(), Ordering::Relaxed);
+        }
 
         out.clear();
         if master < 1.0 || (master - in_sr).abs() <= 0.5 {
@@ -996,15 +1157,41 @@ where
     T: SizedSample + FromSample<f32>,
 {
     let out_ch = out_ch.max(1);
-    let mut cache: HashMap<String, Vec<f32>> = HashMap::new();
-    move |data: &mut [T], _| {
+    let mut st = EvalState::new();
+    move |data: &mut [T], info: &OutputCallbackInfo| {
         let frames = (data.len() / out_ch).min(MAX_BLOCK_FRAMES);
         shared.out_frames.store(frames as u32, Ordering::Relaxed);
         shared.sr.store(sr as u32, Ordering::Relaxed);
-        let cushion = cushion_frames(&shared);
+        // Per-block cushion config: one device block + the adaptive margin (clamped to the
+        // current latency-mode bounds), with a ~CLEAN_DECAY_SECS decay interval in blocks.
+        let block = shared.in_frames.load(Ordering::Relaxed).max(frames as u32) as usize;
+        let decay_blocks = if block > 0 {
+            (CLEAN_DECAY_SECS * sr / block as f32) as u32
+        } else {
+            u32::MAX
+        };
+        let cfg = CushionCfg {
+            block,
+            min_ms: f32::from_bits(shared.min_margin_ms.load(Ordering::Relaxed)),
+            max_ms: f32::from_bits(shared.max_margin_ms.load(Ordering::Relaxed)),
+            decay_blocks,
+        };
         let snap = shared.snapshot.load();
-        cache.clear();
-        let stereo = eval(&snap, &node_id, 0, frames, sr, cushion, &mut cache, 0);
+        st.begin_block();
+
+        // Real output device latency: how far ahead of "now" this block plays out
+        // (cpal callback→playback, i.e. the live buffer padding). Block-size fallback.
+        if let Some(node) = snap.nodes.get(&node_id) {
+            let ts = info.timestamp();
+            let dev_ms = ts
+                .playback
+                .duration_since(&ts.callback)
+                .map(|d| d.as_secs_f32() * 1000.0)
+                .unwrap_or(frames as f32 / sr * 1000.0);
+            node.dev_latency.store(dev_ms.to_bits(), Ordering::Relaxed);
+        }
+
+        let stereo = eval(&snap, &node_id, 0, frames, sr, cfg, &mut st, 0);
 
         // Drive recording recorders as extra roots (so they capture even when not
         // routed to an output). Only the primary output does this, to avoid
@@ -1012,7 +1199,8 @@ where
         if snap.primary_output.as_deref() == Some(node_id.as_str()) {
             for rid in &snap.recorders {
                 if snap.nodes.get(rid).map(|n| n.recording.load(Ordering::Relaxed)).unwrap_or(false) {
-                    let _ = eval(&snap, rid, 0, frames, sr, cushion, &mut cache, 0);
+                    let r = eval(&snap, rid, 0, frames, sr, cfg, &mut st, 0);
+                    st.give(r);
                 }
             }
         }
@@ -1031,5 +1219,6 @@ where
                 }
             }
         }
+        st.give(stereo);
     }
 }

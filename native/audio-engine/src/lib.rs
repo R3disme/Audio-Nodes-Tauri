@@ -169,6 +169,13 @@ impl NativeAudioEngine {
         self.engine.destroy_node(&id);
     }
 
+    /// Set the adaptive-cushion latency mode (`"low"`/`"balanced"`/`"safe"`). Applied
+    /// live — adjusts the per-input cushion margin bounds, no stream rebuild.
+    #[napi]
+    pub fn set_latency_mode(&self, mode: String) {
+        self.engine.set_latency_mode(&mode);
+    }
+
     /// Current meter levels: `"<nodeId>:<index>" -> dB`. Polled by the renderer.
     #[napi]
     pub fn meters(&self) -> HashMap<String, f64> {

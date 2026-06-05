@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import {
-  Minus, Square, X, RefreshCw, Palette, Cpu,
+  Minus, Square, X, RefreshCw, Settings, Cpu,
   LayoutTemplate, Download, Upload, HelpCircle, Gauge
 } from 'lucide-react'
 import { useAudioStore } from '@renderer/store/audioStore'
@@ -28,7 +28,7 @@ export function Toolbar(): JSX.Element {
   const initialized = useAudioStore(s => s.initialized)
   const exportConfig = useAudioStore(s => s.exportConfig)
   const importConfig = useAudioStore(s => s.importConfig)
-  const openThemeEditor = useSettingsStore(s => s.setThemeEditorOpen)
+  const openSettings = useSettingsStore(s => s.setSettingsOpen)
 
   const [latency, setLatency] = useState(0)
   const [guideOpen, setGuideOpen] = useState(false)
@@ -109,7 +109,7 @@ export function Toolbar(): JSX.Element {
         <IconButton onClick={doExport} title="Export config to file"><Download size={13} /></IconButton>
         <IconButton onClick={() => fileRef.current?.click()} title="Import config from file"><Upload size={13} /></IconButton>
         <IconButton onClick={() => refreshDevices()} title="Refresh audio devices"><RefreshCw size={12} /></IconButton>
-        <IconButton onClick={() => openThemeEditor(true)} title="Theme & appearance"><Palette size={13} /></IconButton>
+        <IconButton onClick={() => openSettings(true)} title="Settings"><Settings size={13} /></IconButton>
         <IconButton onClick={() => setGuideOpen(true)} title="Guide"><HelpCircle size={13} /></IconButton>
       </div>
 

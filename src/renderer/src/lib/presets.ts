@@ -16,7 +16,7 @@ function dataFor(type: string, overrides: Data = {}): Data {
     case 'input':       return { ...base, label: 'Input', deviceId: '', deviceName: 'Default', gain: 1, muted: false, ...overrides }
     case 'application': return { ...base, label: 'Application', sourceId: '', sourceName: '', ...overrides }
     case 'output':      return { ...base, label: 'Output', deviceId: '', deviceName: 'Default', volume: 1, muted: false, ...overrides }
-    case 'virtual':     return { ...base, label: 'Virtual Output', deviceId: '', deviceName: 'Default', volume: 1, muted: false, ...overrides }
+    case 'virtual':     return { ...base, label: 'Virtual Output', deviceId: '', deviceName: '', volume: 1, muted: false, ...overrides }
     case 'volume':      return { ...base, label: 'Volume', gain: 1, muted: false, ...overrides }
     case 'eq':          return { ...base, label: 'Equalizer', bands: structuredClone(DEFAULT_EQ_BANDS), ...overrides }
     case 'compressor':  return { ...base, label: 'Compressor', threshold: -24, knee: 6, ratio: 4, attack: 0.003, release: 0.25, ...overrides }

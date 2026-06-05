@@ -207,7 +207,7 @@ function makeNodeSpec(type: string): NodeSpec | null {
     case 'output':
       return { idPrefix: 'output', data: { label: 'Output', deviceId: '', deviceName: 'Default', volume: 1, muted: false, channels: 1 } }
     case 'virtual':
-      return { idPrefix: 'virtual', data: { label: 'Virtual Output', deviceId: '', deviceName: 'Default', volume: 1, muted: false, channels: 1 } }
+      return { idPrefix: 'virtual', data: { label: 'Virtual Output', deviceId: '', deviceName: '', volume: 1, muted: false, channels: 1 } }
     case 'recorder':
       return { idPrefix: 'rec', data: { label: 'Recorder', channels: 1 } }
     case 'volume':
@@ -298,10 +298,20 @@ async function rebuildEngineNode(type: string, id: string, data: Record<string, 
       }
       break
     case 'output':
-    case 'virtual':
-      audioEngine.createOutputNode(id, type === 'virtual' ? 'virtual' : 'output')
+      audioEngine.createOutputNode(id, 'output')
       audioEngine.setGain(id, num(data.volume, 1))
       if (data.muted) audioEngine.muteNode(id, true)
+      // Open the device explicitly ('' ⇒ system default); the engine no longer
+      // auto-opens output streams on create.
+      await audioEngine.setOutputDevice(id, (data.deviceId as string) || '')
+      break
+    case 'virtual':
+      audioEngine.createOutputNode(id, 'virtual')
+      audioEngine.setGain(id, num(data.volume, 1))
+      if (data.muted) audioEngine.muteNode(id, true)
+      // Only open a stream once a real virtual cable is chosen — a device-less
+      // Virtual Output stays silent rather than grabbing the default device (which
+      // would contend with the Output node).
       if (data.deviceId) await audioEngine.setOutputDevice(id, data.deviceId as string)
       break
     case 'recorder':
@@ -713,6 +723,8 @@ export const useAudioStore = create<AudioStore>((set, get) => {
       // Audio this session so there's always sound.
       await ensureBackendAvailable()
       await audioEngine.init()
+      // Apply the persisted latency mode now the engine is up (native; Web Audio no-ops).
+      audioEngine.setLatencyMode(useSettingsStore.getState().latencyMode)
       const devices = await audioEngine.getDevices()
       set({ devices })
 

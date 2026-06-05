@@ -7,7 +7,9 @@ import {
   themeFromImage,
   applyTheme
 } from '@renderer/lib/theme'
-import type { EngineKind } from '@renderer/audio/backend'
+import { audioEngine, type EngineKind } from '@renderer/audio/backend'
+
+export type LatencyMode = 'low' | 'balanced' | 'safe'
 
 // ── Persisted UI settings: theme, sidebar state, node scale, audio engine ───
 
@@ -19,6 +21,8 @@ interface PersistedSettings {
   nodeScale: number
   /** Which audio backend to use. Defaults to 'native' (faster); Web Audio is the fallback. */
   engine: EngineKind
+  /** Adaptive-cushion latency mode (native engine). Defaults to 'balanced'. */
+  latencyMode: LatencyMode
 }
 
 function load(): PersistedSettings {
@@ -30,11 +34,12 @@ function load(): PersistedSettings {
         theme: { ...DEFAULT_THEME, ...p.theme, nodes: { ...DEFAULT_THEME.nodes, ...p.theme?.nodes } },
         sidebarCollapsed: p.sidebarCollapsed ?? false,
         nodeScale: p.nodeScale ?? 1,
-        engine: p.engine === 'webaudio' ? 'webaudio' : 'native'
+        engine: p.engine === 'webaudio' ? 'webaudio' : 'native',
+        latencyMode: p.latencyMode === 'low' || p.latencyMode === 'safe' ? p.latencyMode : 'balanced'
       }
     }
   } catch { /* ignore corrupt settings */ }
-  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1, engine: 'native' }
+  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1, engine: 'native', latencyMode: 'balanced' }
 }
 
 const applyNodeScale = (n: number): void =>
@@ -45,7 +50,8 @@ interface SettingsState {
   sidebarCollapsed: boolean
   nodeScale: number
   engine: EngineKind
-  themeEditorOpen: boolean
+  latencyMode: LatencyMode
+  settingsOpen: boolean
 
   setSimpleAccent: (hex: string) => void
   setAdvancedColor: (token: keyof Theme, hex: string) => void
@@ -60,9 +66,11 @@ interface SettingsState {
   setSidebarCollapsed: (v: boolean) => void
   toggleSidebar: () => void
   setNodeScale: (v: number) => void
-  setThemeEditorOpen: (v: boolean) => void
+  setSettingsOpen: (v: boolean) => void
   /** Switch audio backend. Persists then reloads so the graph rebuilds cleanly. */
   setEngine: (kind: EngineKind) => void
+  /** Set the adaptive-cushion latency mode. Applied live to the engine + persisted. */
+  setLatencyMode: (mode: LatencyMode) => void
 }
 
 const initial = load()
@@ -76,9 +84,9 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
     set({ theme })
   }
   const persist = (): void => {
-    const { theme, sidebarCollapsed, nodeScale, engine } = get()
+    const { theme, sidebarCollapsed, nodeScale, engine, latencyMode } = get()
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ theme, sidebarCollapsed, nodeScale, engine }))
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ theme, sidebarCollapsed, nodeScale, engine, latencyMode }))
     } catch { /* storage full / unavailable — non-fatal */ }
   }
   // Persist after the current synchronous update settles.
@@ -89,7 +97,8 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
     sidebarCollapsed: initial.sidebarCollapsed,
     nodeScale: initial.nodeScale,
     engine: initial.engine,
-    themeEditorOpen: false,
+    latencyMode: initial.latencyMode,
+    settingsOpen: false,
 
     setSimpleAccent: (hex) => {
       commit(deriveSimple(hex, get().theme))
@@ -157,7 +166,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
       afterChange()
     },
 
-    setThemeEditorOpen: (v) => set({ themeEditorOpen: v }),
+    setSettingsOpen: (v) => set({ settingsOpen: v }),
 
     setEngine: (kind) => {
       if (get().engine === kind) return
@@ -166,6 +175,13 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
       // The live graph was built in the previous engine; reload so the chosen
       // engine rebuilds it from persisted state instead of running half-migrated.
       window.location.reload()
+    },
+
+    setLatencyMode: (mode) => {
+      if (get().latencyMode === mode) return
+      set({ latencyMode: mode })
+      audioEngine.setLatencyMode(mode) // live — no reload needed
+      afterChange()
     }
   }
 })

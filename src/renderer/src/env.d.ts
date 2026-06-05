@@ -46,6 +46,7 @@ interface Window {
       setGain: (id: string, gain: number) => void
       setMuted: (id: string, muted: boolean) => void
       setParam: (id: string, param: string, index: number, value: number) => void
+      setLatencyMode: (mode: string) => void
       destroyNode: (id: string) => void
       pollMeters: () => Promise<Record<string, number>>
       latency: () => Promise<number>

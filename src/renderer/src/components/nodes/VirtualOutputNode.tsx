@@ -21,8 +21,15 @@ export function VirtualOutputNode({ id, data, selected }: NodeProps): JSX.Elemen
   const devices = useAudioStore(s => s.devices)
   const updateNodeData = useAudioStore(s => s.updateNodeData)
 
-  const hasVirtual = devices.outputs.some(dev => looksVirtual(dev.label))
-  const hasOurCable = devices.outputs.some(dev => isAudioNodesCable(dev.label))
+  // Restrict to virtual-cable endpoints only — never real/default devices, which would
+  // contend with the Output node on the same WASAPI endpoint. Prefer our driver's cable
+  // when it's present ("only the driver's, when functional"); otherwise fall back to other
+  // detected virtual cables (VB-Cable, VoiceMeeter, …).
+  const ourCables = devices.outputs.filter(dev => isAudioNodesCable(dev.label))
+  const otherCables = devices.outputs.filter(dev => looksVirtual(dev.label) && !isAudioNodesCable(dev.label))
+  const cables = ourCables.length ? ourCables : otherCables
+  const hasVirtual = otherCables.length > 0 || ourCables.length > 0
+  const hasOurCable = ourCables.length > 0
 
   const setVolume = (volume: number): void => {
     updateNodeData(id, { volume })
@@ -47,8 +54,11 @@ export function VirtualOutputNode({ id, data, selected }: NodeProps): JSX.Elemen
       <DeviceSelector
         label="Virtual cable device"
         value={d.deviceId}
-        devices={devices.outputs}
+        devices={cables}
         onChange={setDevice}
+        allowDefault={false}
+        placeholder={cables.length ? 'Select a cable…' : 'No cable detected'}
+        disabled={cables.length === 0}
       />
 
       <div className="flex gap-2 mb-1.5">

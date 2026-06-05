@@ -543,6 +543,10 @@ class AudioEngine implements AudioBackend {
     const audioEl = new Audio()
     audioEl.srcObject = streamDest.stream
     audioEl.autoplay = true
+    // A Virtual Output must not play to the default device until a real cable is chosen
+    // (otherwise it doubles up with the Output node). Start muted; setOutputDevice unmutes
+    // once a non-empty device id is set.
+    if (type === 'virtual') audioEl.muted = true
     // A play() interrupted by an immediate pause()/teardown (e.g. toggling a
     // workspace off right after adding an output) rejects with AbortError —
     // that's benign, so only surface genuine playback failures.
@@ -565,6 +569,8 @@ class AudioEngine implements AudioBackend {
     const node = this.nodes.get(id)
     if (!node?.outputSink) return
     node.outputDeviceId = deviceId
+    // Virtual Output stays silent until a real cable is selected (see createOutputNode).
+    if (node.type === 'virtual') node.outputSink.muted = !deviceId
     try {
       // Empty string selects the system default device.
       await node.outputSink.setSinkId(deviceId || '')
@@ -739,6 +745,9 @@ class AudioEngine implements AudioBackend {
     const out = (ctx as AudioContext & { outputLatency?: number }).outputLatency ?? 0
     return Math.round((base + out) * 1000)
   }
+
+  /** Web Audio latency isn't tunable this way — no-op (satisfies the backend interface). */
+  setLatencyMode(_mode: 'low' | 'balanced' | 'safe'): void {}
 
   // ── Effect: Volume (multi-channel) ──────────────────────────────────────
 

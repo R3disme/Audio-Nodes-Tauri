@@ -26,6 +26,8 @@ export interface AudioBackend {
   // ── Lifecycle ─────────────────────────────────────────────────────────────
   init(): Promise<void>
   getLatencyMs(): number
+  /** Set the latency/cushion mode (native only; Web Audio no-ops). */
+  setLatencyMode(mode: 'low' | 'balanced' | 'safe'): void
 
   // ── Meter + state subscriptions (bypass React) ─────────────────────────────
   subscribeMeter(key: string, cb: (db: number) => void): () => void

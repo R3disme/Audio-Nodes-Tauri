@@ -80,6 +80,10 @@ class NativeEngine implements AudioBackend {
     return Math.round(this.latencyCache)
   }
 
+  setLatencyMode(mode: 'low' | 'balanced' | 'safe'): void {
+    window.api.audio.setLatencyMode(mode)
+  }
+
   // ── Meters: poll the addon each frame, dispatch to DOM subscribers ─────────
 
   private startMeterLoop(): void {

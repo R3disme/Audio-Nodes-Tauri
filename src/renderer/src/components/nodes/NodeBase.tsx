@@ -198,21 +198,30 @@ interface DeviceSelectorProps {
   value: string
   devices: MediaDeviceInfo[]
   onChange: (deviceId: string, deviceName: string) => void
+  /** When false, the empty option is a non-selectable placeholder instead of "Default"
+   *  (used by Virtual Output, which must never fall back to the default device). */
+  allowDefault?: boolean
+  /** Placeholder text for the empty option when `allowDefault` is false. */
+  placeholder?: string
+  disabled?: boolean
 }
 
-export function DeviceSelector({ label, value, devices, onChange }: DeviceSelectorProps): JSX.Element {
+export function DeviceSelector({
+  label, value, devices, onChange, allowDefault = true, placeholder = 'Select…', disabled = false
+}: DeviceSelectorProps): JSX.Element {
   return (
     <div className="mb-2">
       <span className="text-zinc-400 text-[10px] block mb-0.5">{label}</span>
       <select
         value={value}
+        disabled={disabled}
         onChange={e => {
           const d = devices.find(d => d.deviceId === e.target.value)
-          onChange(e.target.value, d?.label ?? 'Default')
+          onChange(e.target.value, d?.label ?? (allowDefault ? 'Default' : ''))
         }}
-        className="w-full bg-zinc-800 border border-zinc-700 hover:border-zinc-600 text-zinc-200 text-[10px] rounded px-1.5 py-1 nodrag focus:outline-none focus:border-orange-500/50"
+        className="w-full bg-zinc-800 border border-zinc-700 hover:border-zinc-600 text-zinc-200 text-[10px] rounded px-1.5 py-1 nodrag focus:outline-none focus:border-orange-500/50 disabled:opacity-50"
       >
-        <option value="">Default</option>
+        <option value="" disabled={!allowDefault}>{allowDefault ? 'Default' : placeholder}</option>
         {devices.map(d => (
           <option key={d.deviceId} value={d.deviceId}>
             {d.label || d.deviceId.slice(0, 24)}

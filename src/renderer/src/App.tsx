@@ -3,7 +3,7 @@ import { Toolbar } from './components/Toolbar'
 import { Sidebar } from './components/Sidebar'
 import { NodeEditor } from './components/NodeEditor'
 import { WorkspaceBar } from './components/WorkspaceBar'
-import { ThemePanel } from './components/ThemePanel'
+import { SettingsPanel } from './components/SettingsPanel'
 
 export function App(): JSX.Element {
   return (
@@ -21,7 +21,7 @@ export function App(): JSX.Element {
           </div>
         </div>
       </div>
-      <ThemePanel />
+      <SettingsPanel />
     </div>
   )
 }
