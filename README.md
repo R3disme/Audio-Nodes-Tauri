@@ -12,7 +12,7 @@ alternative to the Windows volume mixer and tools like Voicemeeter. Wire **input
 **Double-click `start.bat`.**
 
 On the first run it installs everything it needs and then opens the app; after that it
-just launches. You don't need to touch a terminal.
+just launches. You don't even need to touch a terminal.
 
 > Prefer PowerShell? Right-click `start.ps1` → **Run with PowerShell**.
 
