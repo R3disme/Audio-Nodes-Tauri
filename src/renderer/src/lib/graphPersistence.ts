@@ -19,6 +19,11 @@ export interface SavedNode {
   type: string
   position: { x: number; y: number }
   data: Record<string, unknown>
+  /** Group membership: a child node's containing group id (position is relative to it). */
+  parentId?: string
+  /** Container size for `group` nodes (so the box restores at the right dimensions). */
+  width?: number
+  height?: number
 }
 
 export interface SavedEdge {
@@ -54,12 +59,18 @@ export interface SavedWorkspaces {
 // ── Serialization helpers ───────────────────────────────────────────────────
 
 export function serializeNodes(nodes: AudioFlowNode[]): SavedNode[] {
-  return nodes.map(n => ({
-    id: n.id,
-    type: n.type ?? 'unknown',
-    position: { x: n.position.x, y: n.position.y },
-    data: n.data as Record<string, unknown>
-  }))
+  return nodes.map(n => {
+    const style = n.style as { width?: number; height?: number } | undefined
+    return {
+      id: n.id,
+      type: n.type ?? 'unknown',
+      position: { x: n.position.x, y: n.position.y },
+      data: n.data as Record<string, unknown>,
+      ...(n.parentId ? { parentId: n.parentId } : {}),
+      ...(typeof style?.width === 'number' ? { width: style.width } : {}),
+      ...(typeof style?.height === 'number' ? { height: style.height } : {})
+    }
+  })
 }
 
 export function serializeEdges(edges: AudioFlowEdge[]): SavedEdge[] {

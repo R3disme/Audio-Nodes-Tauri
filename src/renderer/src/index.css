@@ -31,12 +31,20 @@
   --node-compressor: #117864;   --node-compressor-dark: #083c32;
   --node-gate: #6e2020;         --node-gate-dark: #371010;
   --node-pan: #4f6d7a;          --node-pan-dark: #27363d;
+  --node-filter: #3b6ea5;       --node-filter-dark: #1d3752;
+  --node-limiter: #1a7a6b;      --node-limiter-dark: #0d3d35;
+  --node-expander: #5a5230;     --node-expander-dark: #2d2918;
   --node-reverb: #1b6f8c;       --node-reverb-dark: #0d3746;
   --node-delay: #2f5fa0;        --node-delay-dark: #172f50;
   --node-chorus: #8e3b8e;       --node-chorus-dark: #471d47;
   --node-distortion: #a35a1e;   --node-distortion-dark: #512d0f;
+  --node-tremolo: #7d5a2f;      --node-tremolo-dark: #3e2d17;
+  --node-bitcrusher: #8a5a2a;   --node-bitcrusher-dark: #452d15;
   --node-mixer: #76448a;        --node-mixer-dark: #3b2245;
   --node-recorder: #b23a48;     --node-recorder-dark: #591d24;
+
+  /* Edge highlight for connections caught in a feedback cycle (silenced by the engine). */
+  --edge-cyclic: #ef4444;
 
   /* Global node UI scale (adaptive scale control) */
   --ui-scale: 1;

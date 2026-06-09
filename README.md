@@ -41,14 +41,17 @@ No global tooling is required for the default build; everything installs via `np
 
 - **Sources** — Input (mic / line-in), **File Player** (play a local audio file),
   Application (capture a window's audio)
-- **Effects** — Volume, 5-band Equalizer, Compressor, Gate, Pan
-- **Creative / FX** — Reverb, Delay/Echo, Chorus, Distortion (great for vocals & karaoke)
+- **Dynamics & tone** — Volume, 5-band Equalizer, Compressor, Gate, **Expander**,
+  **Limiter** (brickwall), **Filter** (LP/HP/BP/notch), Pan
+- **Creative / FX** — Reverb, Delay/Echo, Chorus, **Tremolo / Auto-pan**, Distortion,
+  **Bitcrusher** (great for vocals & karaoke)
 - **Mixing / Out** — 4-channel Mixer, **Output** (physical device),
   **Virtual Output** (route the mix into a virtual cable), **Recorder** (capture to a file)
 
 Effect nodes are **multi-channel** (1–8 independent signal paths via the −/+ in the node
 header — channel 0 never bleeds into channel 1). Sockets and wires are **color-coded by
-node type** so signal flow is easy to trace.
+node type** so signal flow is easy to trace. Select nodes and **group** them into a
+collapsible container (**Ctrl+G**, **Ctrl+Shift+G** to ungroup) to keep big graphs tidy.
 
 ## 🗂 Workspaces (tables)
 
@@ -83,8 +86,8 @@ pair), built from source in [`native/driver/`](native/driver/README.md). Or use
 ## ⚡ Engines: Native (Rust) & Web Audio
 
 Audio Nodes runs on a **native Rust audio engine** (`native/audio-engine/`) by **default**, for
-lower overhead and real device-latency reporting. The **Web Audio** engine is the fully-featured
-fallback — switch between them anytime in the Theme panel.
+lower overhead and real, *measured* device latency. The **Web Audio** engine is the fully-featured
+fallback — switch between them anytime in the Settings panel.
 
 ```bash
 npm run build:native     # compile the Rust addon (needs the Rust toolchain)
@@ -92,9 +95,12 @@ npm run build:native     # compile the Rust addon (needs the Rust toolchain)
 
 - If the addon **isn't built**, the app **transparently uses Web Audio** for that session — so
   `start.bat` always has sound; build the addon to unlock the native engine.
-- A few features are **Web Audio-only** for now and are clearly disabled on native: the
-  **File Player**, **recording to a file**, and **application capture**. The native engine also
-  expects input/output at the same sample rate (e.g. 48 kHz). These are being ported.
+- **Every node works on both engines** — File Player, Recorder and Application capture are all
+  ported to native. Mismatched input/output sample rates are handled by a built-in resampler.
+- **Latency modes** (Settings → Audio): the input cushion **self-tunes**, and you pick its range
+  with **Low / Balanced / Safe**. An **Output backend** option adds WASAPI **low-latency** and
+  **exclusive** modes (exclusive bypasses the Windows mixer for the lowest latency on capable
+  hardware, but locks the device); both fall back to the shared path automatically.
 
 ## 🎨 Theming
 
@@ -104,7 +110,7 @@ Open the palette button in the toolbar:
 - **Advanced** — fine-tune every interface token and each node color.
 - **Picture** — generate a palette from an image (optionally shown as the canvas background).
 
-There's also a **node-scale** slider, a collapsible add-node rail, and per-node recolor (click
+There's also a **node-scale** slider, a hideable add-node panel, and per-node recolor (click
 the color dot in a node header; right-click to reset).
 
 ## 🧩 Workflow
@@ -112,8 +118,9 @@ the color dot in a node header; right-click to reset).
 - **Presets** (toolbar) — one-click starting graphs: Mic→Speakers, Podcast, Karaoke, Streaming.
 - **Export / Import** (toolbar) — save the whole config (all workspaces + theme) to a `.json`.
 - **Guide** (toolbar `?`) — an in-app visual walkthrough.
-- **Latency** — the toolbar shows estimated input→output latency.
-- **Auto-recovery** — dropped input devices reconnect when they return; outputs re-bind their device.
+- **Latency** — the toolbar shows the **measured** input→output latency; tune it in Settings → Audio.
+- **Auto-recovery** — dropped input devices reconnect when they return (matched by name even if the
+  device id changed); outputs re-bind their device.
 
 ## 🧪 End-to-end checks
 

@@ -23,7 +23,7 @@ export function OutputNode({ id, data, selected }: NodeProps): JSX.Element {
 
   const setDevice = async (deviceId: string, deviceName: string): Promise<void> => {
     updateNodeData(id, { deviceId, deviceName })
-    if (deviceId) await audioEngine.setOutputDevice(id, deviceId)
+    if (deviceId) await audioEngine.setOutputDevice(id, deviceId, deviceName)
   }
 
   return (

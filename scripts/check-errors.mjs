@@ -37,7 +37,8 @@ await new Promise(r => setTimeout(r, 1500));
 // Add all node types
 const types = [
   'input', 'fileplayer', 'application', 'volume', 'eq', 'compressor', 'gate',
-  'reverb', 'delay', 'chorus', 'distortion', 'pan', 'mixer', 'output', 'recorder'
+  'reverb', 'delay', 'chorus', 'distortion', 'pan', 'mixer', 'output', 'recorder',
+  'filter', 'limiter', 'expander', 'tremolo', 'bitcrusher'
 ];
 for (const t of types) {
   await page.evaluate(type => window.__audioStore.getState().addNode(type), t);
@@ -72,6 +73,36 @@ await page.evaluate(() => {
   e.setChorus(byType('chorus').id, { rate: 3, depth: 0.005, mix: 0.6 });
   e.setDistortion(byType('distortion').id, { drive: 20, mix: 0.7 });
   e.setPan(byType('pan').id, -0.8);
+  e.setFilter(byType('filter').id, { type: 1, cutoff: 800, q: 2 });
+  e.setLimiter(byType('limiter').id, { threshold: -3, release: 0.2 });
+  e.setExpander(byType('expander').id, { threshold: -45, ratio: 3, attack: 0.005, release: 0.2 });
+  e.setTremolo(byType('tremolo').id, { mode: 1, shape: 1, rate: 6, depth: 0.8 });
+  e.setBitcrusher(byType('bitcrusher').id, { bits: 6, downsample: 4, mix: 0.9 });
+});
+
+// Sub-graph grouping: select two nodes, group, collapse/expand, ungroup.
+await page.evaluate(() => {
+  const store = window.__audioStore;
+  const ns = store.getState().nodes;
+  const a = ns.find(n => n.type === 'volume');
+  const b = ns.find(n => n.type === 'eq');
+  store.setState({ nodes: store.getState().nodes.map(n => (n.id === a.id || n.id === b.id) ? { ...n, selected: true } : n) });
+  store.getState().groupSelection();
+  const grp = store.getState().nodes.find(n => n.type === 'subgraph');
+  store.getState().toggleGroupCollapsed(grp.id);  // collapse
+  store.getState().toggleGroupCollapsed(grp.id);  // expand
+  store.getState().ungroup(grp.id);
+
+  // Re-group, then DELETE the group — children must survive with no dangling parentId.
+  const ns2 = store.getState().nodes;
+  const c = ns2.find(n => n.type === 'volume');
+  const dd = ns2.find(n => n.type === 'eq');
+  store.setState({ nodes: store.getState().nodes.map(n => (n.id === c.id || n.id === dd.id) ? { ...n, selected: true } : n) });
+  store.getState().groupSelection();
+  const grp2 = store.getState().nodes.find(n => n.type === 'subgraph');
+  store.getState().removeNode(grp2.id);
+  const orphan = store.getState().nodes.find(n => n.parentId === grp2.id);
+  if (orphan) throw new Error('group deletion left an orphaned child with dangling parentId');
 });
 
 // Workspaces: create a second table, add nodes, disable (teardown) → edit

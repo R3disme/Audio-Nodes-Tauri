@@ -5,8 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Audio Nodes</title>
     <!-- Allow data:/blob: for images (theme pictures, capture thumbnails) and media
-         (file player, recording playback). Scripts stay locked to 'self'. -->
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:" />
+         (file player, recording playback). `blob:` is also allowed for script/worker so
+         the bitcrusher AudioWorklet can load from a Blob module URL (local app only). -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' blob:; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' data: blob:" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
   </head>
   <body>

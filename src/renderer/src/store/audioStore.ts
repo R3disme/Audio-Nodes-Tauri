@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { nodeColor } from '@renderer/lib/nodeColors'
+import { findCyclicEdgeIds } from '@renderer/lib/graphCycles'
 import {
   serializeNodes,
   serializeEdges,
@@ -30,6 +31,11 @@ import {
   DEFAULT_CHORUS,
   DEFAULT_DISTORTION,
   DEFAULT_PAN,
+  DEFAULT_FILTER,
+  DEFAULT_LIMITER,
+  DEFAULT_EXPANDER,
+  DEFAULT_TREMOLO,
+  DEFAULT_CRUSHER,
   type EQBand,
   type AudioNodeType
 } from '@renderer/audio/AudioEngine'
@@ -117,6 +123,37 @@ export interface PanNodeData extends BaseNodeData {
   pan: number
 }
 
+export interface FilterNodeData extends BaseNodeData {
+  filterType: number   // 0 low-pass, 1 high-pass, 2 band-pass, 3 notch
+  cutoff: number
+  q: number
+}
+
+export interface LimiterNodeData extends BaseNodeData {
+  threshold: number
+  release: number
+}
+
+export interface ExpanderNodeData extends BaseNodeData {
+  threshold: number
+  ratio: number
+  attack: number
+  release: number
+}
+
+export interface TremoloNodeData extends BaseNodeData {
+  mode: number   // 0 tremolo, 1 auto-pan
+  shape: number  // 0 sine, 1 triangle
+  rate: number
+  depth: number
+}
+
+export interface BitcrusherNodeData extends BaseNodeData {
+  bits: number
+  downsample: number
+  mix: number
+}
+
 // Recording is transient engine state (not persisted); the node data carries only
 // the common fields.
 export type RecorderNodeData = BaseNodeData
@@ -142,6 +179,11 @@ export type AudioNodeData =
   | ChorusNodeData
   | DistortionNodeData
   | PanNodeData
+  | FilterNodeData
+  | LimiterNodeData
+  | ExpanderNodeData
+  | TremoloNodeData
+  | BitcrusherNodeData
   | RecorderNodeData
   | FilePlayerNodeData
 
@@ -228,6 +270,16 @@ function makeNodeSpec(type: string): NodeSpec | null {
       return { idPrefix: 'dist', data: { label: 'Distortion', ...DEFAULT_DISTORTION, channels: 1 } }
     case 'pan':
       return { idPrefix: 'pan', data: { label: 'Pan', ...DEFAULT_PAN, channels: 1 } }
+    case 'filter':
+      return { idPrefix: 'filter', data: { label: 'Filter', filterType: DEFAULT_FILTER.type, cutoff: DEFAULT_FILTER.cutoff, q: DEFAULT_FILTER.q, channels: 1 } }
+    case 'limiter':
+      return { idPrefix: 'limiter', data: { label: 'Limiter', ...DEFAULT_LIMITER, channels: 1 } }
+    case 'expander':
+      return { idPrefix: 'exp', data: { label: 'Expander', ...DEFAULT_EXPANDER, channels: 1 } }
+    case 'tremolo':
+      return { idPrefix: 'trem', data: { label: 'Tremolo', ...DEFAULT_TREMOLO, channels: 1 } }
+    case 'bitcrusher':
+      return { idPrefix: 'crush', data: { label: 'Bitcrusher', ...DEFAULT_CRUSHER, channels: 1 } }
     case 'mixer': {
       const channelCount = 4
       return {
@@ -278,7 +330,7 @@ async function rebuildEngineNode(type: string, id: string, data: Record<string, 
   const ch = num(data.channels, 1)
   switch (type) {
     case 'input':
-      await audioEngine.createInputNode(id, (data.deviceId as string) || undefined)
+      await audioEngine.createInputNode(id, (data.deviceId as string) || undefined, data.deviceName as string | undefined)
       audioEngine.setGain(id, num(data.gain, 1))
       if (data.muted) audioEngine.muteNode(id, true)
       break
@@ -303,7 +355,7 @@ async function rebuildEngineNode(type: string, id: string, data: Record<string, 
       if (data.muted) audioEngine.muteNode(id, true)
       // Open the device explicitly ('' ⇒ system default); the engine no longer
       // auto-opens output streams on create.
-      await audioEngine.setOutputDevice(id, (data.deviceId as string) || '')
+      await audioEngine.setOutputDevice(id, (data.deviceId as string) || '', data.deviceName as string | undefined)
       break
     case 'virtual':
       audioEngine.createOutputNode(id, 'virtual')
@@ -312,7 +364,7 @@ async function rebuildEngineNode(type: string, id: string, data: Record<string, 
       // Only open a stream once a real virtual cable is chosen — a device-less
       // Virtual Output stays silent rather than grabbing the default device (which
       // would contend with the Output node).
-      if (data.deviceId) await audioEngine.setOutputDevice(id, data.deviceId as string)
+      if (data.deviceId) await audioEngine.setOutputDevice(id, data.deviceId as string, data.deviceName as string | undefined)
       break
     case 'recorder':
       audioEngine.createRecorderNode(id)
@@ -357,6 +409,31 @@ async function rebuildEngineNode(type: string, id: string, data: Record<string, 
     case 'distortion':
       audioEngine.createDistortionNode(id, ch, { drive: num(data.drive, DEFAULT_DISTORTION.drive), mix: num(data.mix, DEFAULT_DISTORTION.mix) })
       break
+    case 'filter':
+      audioEngine.createFilterNode(id, ch, {
+        type: num(data.filterType, DEFAULT_FILTER.type), cutoff: num(data.cutoff, DEFAULT_FILTER.cutoff), q: num(data.q, DEFAULT_FILTER.q)
+      })
+      break
+    case 'limiter':
+      audioEngine.createLimiterNode(id, ch, { threshold: num(data.threshold, DEFAULT_LIMITER.threshold), release: num(data.release, DEFAULT_LIMITER.release) })
+      break
+    case 'expander':
+      audioEngine.createExpanderNode(id, ch, {
+        threshold: num(data.threshold, DEFAULT_EXPANDER.threshold), ratio: num(data.ratio, DEFAULT_EXPANDER.ratio),
+        attack: num(data.attack, DEFAULT_EXPANDER.attack), release: num(data.release, DEFAULT_EXPANDER.release)
+      })
+      break
+    case 'tremolo':
+      audioEngine.createTremoloNode(id, ch, {
+        mode: num(data.mode, DEFAULT_TREMOLO.mode), shape: num(data.shape, DEFAULT_TREMOLO.shape),
+        rate: num(data.rate, DEFAULT_TREMOLO.rate), depth: num(data.depth, DEFAULT_TREMOLO.depth)
+      })
+      break
+    case 'bitcrusher':
+      audioEngine.createBitcrusherNode(id, ch, {
+        bits: num(data.bits, DEFAULT_CRUSHER.bits), downsample: num(data.downsample, DEFAULT_CRUSHER.downsample), mix: num(data.mix, DEFAULT_CRUSHER.mix)
+      })
+      break
     case 'mixer': {
       const mc = num(data.channelCount, num(data.channels, 4))
       audioEngine.createMixerNode(id, mc)
@@ -376,19 +453,90 @@ function edgeStrokeFor(srcNode?: { type?: string; data?: Record<string, unknown>
   return typeof override === 'string' && override ? override : nodeColor(srcNode?.type)
 }
 
+/**
+ * Recompute feedback-cycle flags for `edges` and restyle them: edges on a cycle
+ * (which the engine silences) are painted with the warning color + dashed, the
+ * rest fall back to their source node's accent. Call this after any edge add/remove
+ * so the flag stays in sync with the topology. Cheap (graphs are small).
+ */
+function applyCycleStyles(nodes: AudioFlowNode[], edges: AudioFlowEdge[]): AudioFlowEdge[] {
+  const cyclic = findCyclicEdgeIds(edges)
+  return edges.map(e => {
+    const isCyclic = cyclic.has(e.id)
+    const base = edgeStrokeFor(nodes.find(n => n.id === e.source))
+    return {
+      ...e,
+      data: { ...(e.data ?? {}), cyclic: isCyclic },
+      style: {
+        ...e.style,
+        stroke: isCyclic ? 'var(--edge-cyclic, #ef4444)' : base,
+        strokeWidth: 2,
+        strokeDasharray: isCyclic ? '6 4' : undefined
+      }
+    } as AudioFlowEdge
+  })
+}
+
+/**
+ * When `subgraph` group nodes are about to be removed, release their children:
+ * restore absolute positions and clear `parentId`/`extent` so React Flow is never
+ * left with a child pointing at a deleted parent (which breaks rendering). Returns the
+ * node list with children released; the caller still removes the group nodes themselves.
+ */
+function releaseGroupChildren(nodes: AudioFlowNode[], removedIds: Set<string>): AudioFlowNode[] {
+  const removedGroups = new Map<string, { x: number; y: number }>()
+  for (const n of nodes) {
+    if (removedIds.has(n.id) && n.type === 'subgraph') removedGroups.set(n.id, n.position)
+  }
+  if (removedGroups.size === 0) return nodes
+  return nodes.map(n => {
+    const origin = n.parentId ? removedGroups.get(n.parentId) : undefined
+    if (!origin) return n
+    return {
+      ...n,
+      parentId: undefined,
+      extent: undefined,
+      hidden: false,
+      position: { x: n.position.x + origin.x, y: n.position.y + origin.y }
+    }
+  })
+}
+
 /** Rehydrate plain saved nodes/edges into React Flow objects (no engine work). */
 function deserializeGraph(savedNodes: SavedNode[], savedEdges: SavedEdge[]): { nodes: AudioFlowNode[]; edges: AudioFlowEdge[] } {
-  const nodes = savedNodes.map(n => ({
-    id: n.id, type: n.type, position: n.position, data: n.data
-  })) as AudioFlowNode[]
-  const edges = savedEdges.map(e => {
+  const nodes = savedNodes.map(n => {
+    const node: Record<string, unknown> = { id: n.id, type: n.type, position: n.position, data: n.data }
+    if (n.parentId) { node.parentId = n.parentId; node.extent = 'parent' }
+    if (typeof n.width === 'number' || typeof n.height === 'number') {
+      node.style = { ...(n.width != null ? { width: n.width } : {}), ...(n.height != null ? { height: n.height } : {}) }
+    }
+    return node
+  }) as AudioFlowNode[]
+  // React Flow requires a parent node to precede its children in the array.
+  nodes.sort((a, b) => Number(b.type === 'subgraph') - Number(a.type === 'subgraph'))
+
+  // Re-apply collapsed-group visibility: hide member nodes + edges touching them.
+  const hiddenMembers = new Set<string>()
+  for (const g of nodes) {
+    if (g.type === 'subgraph' && (g.data as Record<string, unknown>)?.collapsed) {
+      for (const c of nodes) {
+        if (c.parentId === g.id) { c.hidden = true; hiddenMembers.add(c.id) }
+      }
+    }
+  }
+
+  let edges = savedEdges.map(e => {
     const srcNode = savedNodes.find(n => n.id === e.source)
+    const hidden = hiddenMembers.has(e.source) || hiddenMembers.has(e.target)
     return {
       id: e.id, source: e.source, target: e.target,
       sourceHandle: e.sourceHandle, targetHandle: e.targetHandle,
-      style: { stroke: edgeStrokeFor(srcNode), strokeWidth: 2 }
+      style: { stroke: edgeStrokeFor(srcNode), strokeWidth: 2 },
+      ...(hidden ? { hidden: true } : {})
     }
   }) as AudioFlowEdge[]
+  edges = applyCycleStyles(nodes, edges)
+  // Flag any feedback cycles in the loaded graph so they paint as warnings.
   return { nodes, edges }
 }
 
@@ -400,6 +548,7 @@ function materializeWorkspace(w: SavedWorkspace): Workspace {
 /** Build engine nodes + connections for a graph (used when a workspace activates). */
 async function buildEngine(nodes: AudioFlowNode[], edges: AudioFlowEdge[]): Promise<void> {
   for (const n of nodes) {
+    if (n.type === 'subgraph') continue // visual container — no engine node
     try {
       await rebuildEngineNode(n.type ?? '', n.id, n.data as Record<string, unknown>)
     } catch (e) {
@@ -464,6 +613,14 @@ interface AudioStore {
   setNodeChannels: (id: string, type: AudioNodeType, channels: number) => void
   setNodeColor: (id: string, color: string | null) => void
 
+  // ── Grouping (visual sub-graphs; the audio graph is unchanged) ──
+  /** Collapse the current node selection into a movable group container. */
+  groupSelection: () => void
+  /** Dissolve a group, restoring its members to absolute positions. */
+  ungroup: (groupId: string) => void
+  /** Collapse/expand a group (hides its members + their edges when collapsed). */
+  toggleGroupCollapsed: (groupId: string) => void
+
   // ── Workspaces ──
   addWorkspace: () => void
   removeWorkspace: (id: string) => void
@@ -502,7 +659,12 @@ export const useAudioStore = create<AudioStore>((set, get) => {
       changes.forEach(c => {
         if (c.type === 'remove') audioEngine.destroyNode(c.id)
       })
-      set(s => ({ nodes: applyNodeChanges(changes, s.nodes) as AudioFlowNode[] }))
+      set(s => {
+        const removed = new Set(changes.filter(c => c.type === 'remove').map(c => c.id))
+        // Release any deleted group's children before the group is removed.
+        const base = removed.size ? releaseGroupChildren(s.nodes, removed) : s.nodes
+        return { nodes: applyNodeChanges(changes, base) as AudioFlowNode[] }
+      })
     },
 
     onEdgesChange: (changes) => {
@@ -519,7 +681,7 @@ export const useAudioStore = create<AudioStore>((set, get) => {
           }
         }
       })
-      set(s => ({ edges: applyEdgeChanges(changes, s.edges) }))
+      set(s => ({ edges: applyCycleStyles(s.nodes, applyEdgeChanges(changes, s.edges)) }))
     },
 
     onConnect: (connection: Connection) => {
@@ -548,13 +710,16 @@ export const useAudioStore = create<AudioStore>((set, get) => {
       const stroke = nodeColor(sourceType)
 
       set(s => ({
-        edges: addEdge(
-          {
-            ...connection,
-            id: `${connection.source}:${srcCh}->${connection.target}:${tgtCh}`,
-            style: { stroke, strokeWidth: 2 }
-          },
-          s.edges
+        edges: applyCycleStyles(
+          s.nodes,
+          addEdge(
+            {
+              ...connection,
+              id: `${connection.source}:${srcCh}->${connection.target}:${tgtCh}`,
+              style: { stroke, strokeWidth: 2 }
+            },
+            s.edges
+          )
         )
       }))
     },
@@ -584,10 +749,13 @@ export const useAudioStore = create<AudioStore>((set, get) => {
 
     removeNode: (id) => {
       audioEngine.destroyNode(id)
-      set(s => ({
-        nodes: s.nodes.filter(n => n.id !== id),
-        edges: s.edges.filter(e => e.source !== id && e.target !== id)
-      }))
+      set(s => {
+        // If `id` is a group, release its children first so none are left orphaned.
+        const released = releaseGroupChildren(s.nodes, new Set([id]))
+        const nodes = released.filter(n => n.id !== id)
+        const edges = s.edges.filter(e => e.source !== id && e.target !== id)
+        return { nodes, edges: applyCycleStyles(nodes, edges) }
+      })
     },
 
     updateNodeData: (id, data) => {
@@ -616,7 +784,7 @@ export const useAudioStore = create<AudioStore>((set, get) => {
             if (e.target === id && (parseHandle(e.targetHandle)?.channel ?? 0) >= channels) return false
             return true
           })
-          return { nodes, edges }
+          return { nodes, edges: applyCycleStyles(nodes, edges) }
         })
         return
       }
@@ -638,7 +806,7 @@ export const useAudioStore = create<AudioStore>((set, get) => {
           }
           return true
         })
-        return { nodes, edges }
+        return { nodes, edges: applyCycleStyles(nodes, edges) }
       })
     },
 
@@ -648,9 +816,118 @@ export const useAudioStore = create<AudioStore>((set, get) => {
         const nodes = s.nodes.map(n =>
           n.id === id ? { ...n, data: { ...n.data, color: color ?? undefined } as AudioNodeData & Record<string, unknown> } : n
         )
-        const srcNode = nodes.find(n => n.id === id)
-        const stroke = edgeStrokeFor(srcNode)
-        const edges = s.edges.map(e => (e.source === id ? { ...e, style: { ...e.style, stroke } } : e))
+        // Recompute every edge's stroke (picks up the new accent) and keep cyclic
+        // edges painted as warnings rather than recoloring them to the accent.
+        const edges = applyCycleStyles(nodes, s.edges)
+        return { nodes, edges }
+      })
+    },
+
+    // ── Grouping (visual sub-graphs) ────────────────────────────────────────────
+    // A `group` node is a movable container; members get `parentId` so they move with
+    // it and clip to it. The audio engine never sees group nodes (buildEngine skips
+    // them), so grouping is purely organizational — connections keep working.
+
+    groupSelection: () => {
+      set(s => {
+        const members = s.nodes.filter(n => n.selected && n.type !== 'subgraph' && !n.parentId)
+        if (members.length < 2) return {}
+        const PAD = 28
+        const HEADER = 30
+        const dim = (n: AudioFlowNode): { w: number; h: number } => ({
+          w: n.measured?.width ?? 220,
+          h: n.measured?.height ?? 120
+        })
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity
+        for (const n of members) {
+          const { w, h } = dim(n)
+          minX = Math.min(minX, n.position.x)
+          minY = Math.min(minY, n.position.y)
+          maxX = Math.max(maxX, n.position.x + w)
+          maxY = Math.max(maxY, n.position.y + h)
+        }
+        const originX = minX - PAD
+        const originY = minY - PAD - HEADER
+        const width = (maxX - minX) + PAD * 2
+        const height = (maxY - minY) + PAD * 2 + HEADER
+        const gid = nextId('subgraph')
+        const memberIds = new Set(members.map(m => m.id))
+        const groupNode = {
+          id: gid,
+          type: 'subgraph',
+          position: { x: originX, y: originY },
+          data: { label: 'Group', collapsed: false, expandedWidth: width, expandedHeight: height },
+          style: { width, height },
+          selected: false
+        } as unknown as AudioFlowNode
+        const updated = s.nodes.map(n =>
+          memberIds.has(n.id)
+            ? {
+                ...n,
+                parentId: gid,
+                extent: 'parent' as const,
+                selected: false,
+                position: { x: n.position.x - originX, y: n.position.y - originY }
+              }
+            : n
+        )
+        // Group must precede its children in the array (React Flow requirement).
+        return { nodes: [groupNode, ...updated] }
+      })
+    },
+
+    ungroup: (groupId) => {
+      set(s => {
+        const group = s.nodes.find(n => n.id === groupId && n.type === 'subgraph')
+        if (!group) return {}
+        const ox = group.position.x
+        const oy = group.position.y
+        const memberIds = new Set(s.nodes.filter(n => n.parentId === groupId).map(n => n.id))
+        const nodes = s.nodes
+          .filter(n => n.id !== groupId)
+          .map(n =>
+            n.parentId === groupId
+              ? {
+                  ...n,
+                  parentId: undefined,
+                  extent: undefined,
+                  hidden: false,
+                  position: { x: n.position.x + ox, y: n.position.y + oy }
+                }
+              : n
+          )
+        const edges = s.edges.map(e =>
+          e.hidden && (memberIds.has(e.source) || memberIds.has(e.target)) ? { ...e, hidden: false } : e
+        )
+        return { nodes, edges }
+      })
+    },
+
+    toggleGroupCollapsed: (groupId) => {
+      set(s => {
+        const group = s.nodes.find(n => n.id === groupId && n.type === 'subgraph')
+        if (!group) return {}
+        const data = group.data as Record<string, unknown>
+        const collapsed = !data.collapsed
+        const memberIds = new Set(s.nodes.filter(n => n.parentId === groupId).map(n => n.id))
+        const style = group.style as { width?: number; height?: number } | undefined
+        const expandedWidth = (data.expandedWidth as number) ?? style?.width ?? 240
+        const expandedHeight = (data.expandedHeight as number) ?? style?.height ?? 160
+        const nodes = s.nodes.map(n => {
+          if (n.id === groupId) {
+            return {
+              ...n,
+              data: { ...data, collapsed, expandedWidth, expandedHeight },
+              // Collapsed: shrink to the header (no height → sizes to content).
+              style: collapsed ? { width: 200 } : { width: expandedWidth, height: expandedHeight }
+            } as unknown as AudioFlowNode
+          }
+          if (memberIds.has(n.id)) return { ...n, hidden: collapsed }
+          return n
+        })
+        const edges = s.edges.map(e =>
+          memberIds.has(e.source) || memberIds.has(e.target) ? { ...e, hidden: collapsed } : e
+        )
         return { nodes, edges }
       })
     },
@@ -723,8 +1000,10 @@ export const useAudioStore = create<AudioStore>((set, get) => {
       // Audio this session so there's always sound.
       await ensureBackendAvailable()
       await audioEngine.init()
-      // Apply the persisted latency mode now the engine is up (native; Web Audio no-ops).
+      // Apply the persisted latency + device modes now the engine is up (native; Web
+      // Audio no-ops). Device mode must be set before any output stream opens.
       audioEngine.setLatencyMode(useSettingsStore.getState().latencyMode)
+      audioEngine.setDeviceMode(useSettingsStore.getState().deviceMode)
       const devices = await audioEngine.getDevices()
       set({ devices })
 

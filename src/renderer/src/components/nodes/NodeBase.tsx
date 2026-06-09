@@ -20,6 +20,11 @@ const headerIcons: Record<string, string> = {
   chorus:      '🌀',
   distortion:  '⚡',
   pan:         '↔',
+  filter:      '🔉',
+  limiter:     '🧱',
+  expander:    '📈',
+  tremolo:     '〰',
+  bitcrusher:  '👾',
   mixer:       '🎛',
   recorder:    '⏺'
 }

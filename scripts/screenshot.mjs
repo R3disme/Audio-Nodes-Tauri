@@ -151,4 +151,29 @@ const shot3 = join(SHOT_DIR, 'after-channel-shrink.png');
 await page.screenshot({ path: shot3 });
 console.log('Screenshot saved:', shot3);
 
+// Sub-graph grouping: select the creative-FX tail and collapse it into a group.
+await page.evaluate(() => {
+  const store = window.__audioStore;
+  const want = new Set(['chorus', 'reverb', 'delay', 'pan']);
+  store.setState({ nodes: store.getState().nodes.map(n => (want.has(n.type) ? { ...n, selected: true } : n)) });
+  store.getState().groupSelection();
+});
+await new Promise(r => setTimeout(r, 500));
+await page.evaluate(() => document.querySelector('.react-flow__controls-fitview')?.click());
+await new Promise(r => setTimeout(r, 500));
+const shot4 = join(SHOT_DIR, 'grouped.png');
+await page.screenshot({ path: shot4 });
+console.log('Screenshot saved:', shot4);
+
+// Collapse the group.
+await page.evaluate(() => {
+  const store = window.__audioStore;
+  const grp = store.getState().nodes.find(n => n.type === 'subgraph');
+  if (grp) store.getState().toggleGroupCollapsed(grp.id);
+});
+await new Promise(r => setTimeout(r, 500));
+const shot5 = join(SHOT_DIR, 'grouped-collapsed.png');
+await page.screenshot({ path: shot5 });
+console.log('Screenshot saved:', shot5);
+
 await app.close();

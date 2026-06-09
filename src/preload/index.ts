@@ -54,6 +54,7 @@ const api = {
     setParam: (id: string, param: string, index: number, value: number): void =>
       ipcRenderer.send('audio:set-param', id, param, index, value),
     setLatencyMode: (mode: string): void => ipcRenderer.send('audio:set-latency-mode', mode),
+    setDeviceMode: (mode: string): void => ipcRenderer.send('audio:set-device-mode', mode),
     destroyNode: (id: string): void => ipcRenderer.send('audio:destroy-node', id),
     pollMeters: (): Promise<Record<string, number>> => ipcRenderer.invoke('audio:poll-meters'),
     latency: (): Promise<number> => ipcRenderer.invoke('audio:latency'),

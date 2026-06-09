@@ -10,6 +10,10 @@ import {
 import { audioEngine, type EngineKind } from '@renderer/audio/backend'
 
 export type LatencyMode = 'low' | 'balanced' | 'safe'
+// Output device backend (native engine). 'shared' = cpal/WASAPI shared (stable default);
+// 'lowlatency' = WASAPI IAudioClient3 shared low-latency; 'exclusive' = WASAPI exclusive
+// mode (bypasses the mixer + locks the device). All fall back to cpal on failure.
+export type DeviceMode = 'shared' | 'lowlatency' | 'exclusive'
 
 // ── Persisted UI settings: theme, sidebar state, node scale, audio engine ───
 
@@ -23,6 +27,8 @@ interface PersistedSettings {
   engine: EngineKind
   /** Adaptive-cushion latency mode (native engine). Defaults to 'balanced'. */
   latencyMode: LatencyMode
+  /** Output device backend (native engine). Defaults to 'shared'. */
+  deviceMode: DeviceMode
 }
 
 function load(): PersistedSettings {
@@ -35,11 +41,12 @@ function load(): PersistedSettings {
         sidebarCollapsed: p.sidebarCollapsed ?? false,
         nodeScale: p.nodeScale ?? 1,
         engine: p.engine === 'webaudio' ? 'webaudio' : 'native',
-        latencyMode: p.latencyMode === 'low' || p.latencyMode === 'safe' ? p.latencyMode : 'balanced'
+        latencyMode: p.latencyMode === 'low' || p.latencyMode === 'safe' ? p.latencyMode : 'balanced',
+        deviceMode: p.deviceMode === 'lowlatency' || p.deviceMode === 'exclusive' ? p.deviceMode : 'shared'
       }
     }
   } catch { /* ignore corrupt settings */ }
-  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1, engine: 'native', latencyMode: 'balanced' }
+  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1, engine: 'native', latencyMode: 'balanced', deviceMode: 'shared' }
 }
 
 const applyNodeScale = (n: number): void =>
@@ -51,6 +58,7 @@ interface SettingsState {
   nodeScale: number
   engine: EngineKind
   latencyMode: LatencyMode
+  deviceMode: DeviceMode
   settingsOpen: boolean
 
   setSimpleAccent: (hex: string) => void
@@ -71,6 +79,8 @@ interface SettingsState {
   setEngine: (kind: EngineKind) => void
   /** Set the adaptive-cushion latency mode. Applied live to the engine + persisted. */
   setLatencyMode: (mode: LatencyMode) => void
+  /** Switch output device backend. Persists then reloads so outputs re-open in the new mode. */
+  setDeviceMode: (mode: DeviceMode) => void
 }
 
 const initial = load()
@@ -84,9 +94,9 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
     set({ theme })
   }
   const persist = (): void => {
-    const { theme, sidebarCollapsed, nodeScale, engine, latencyMode } = get()
+    const { theme, sidebarCollapsed, nodeScale, engine, latencyMode, deviceMode } = get()
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ theme, sidebarCollapsed, nodeScale, engine, latencyMode }))
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ theme, sidebarCollapsed, nodeScale, engine, latencyMode, deviceMode }))
     } catch { /* storage full / unavailable — non-fatal */ }
   }
   // Persist after the current synchronous update settles.
@@ -98,6 +108,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
     nodeScale: initial.nodeScale,
     engine: initial.engine,
     latencyMode: initial.latencyMode,
+    deviceMode: initial.deviceMode,
     settingsOpen: false,
 
     setSimpleAccent: (hex) => {
@@ -182,6 +193,15 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
       set({ latencyMode: mode })
       audioEngine.setLatencyMode(mode) // live — no reload needed
       afterChange()
+    },
+
+    setDeviceMode: (mode) => {
+      if (get().deviceMode === mode) return
+      set({ deviceMode: mode })
+      persist()
+      // Device mode must be set before outputs open; reload so initAudio replays it
+      // to the engine and reopens the output streams in the chosen mode.
+      window.location.reload()
     }
   }
 })

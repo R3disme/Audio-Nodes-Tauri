@@ -33,7 +33,7 @@
 //     reverb of the Web Audio engine.
 // ────────────────────────────────────────────────────────────────────────────
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
@@ -144,6 +144,8 @@ fn rms(buf: &[f32]) -> f32 {
 
 mod dsp;
 use dsp::Dsp;
+#[cfg(windows)]
+mod wasapi;
 
 // ── Node kinds the engine understands ───────────────────────────────────────
 
@@ -161,7 +163,13 @@ pub enum Kind {
     Chorus,
     Distortion,
     Pan,
-    /// System-audio loopback capture (the Application node). Pops a ring like Input.
+    Filter,
+    Limiter,
+    Expander,
+    Tremolo,
+    Crusher,
+    /// PCM fed in over IPC (Application loopback capture + the File Player). Pops a
+    /// ring like Input.
     Loopback,
     /// Records its incoming signal to a file. Passes audio through.
     Recorder,
@@ -173,7 +181,9 @@ impl Kind {
     fn from_type(t: &str) -> Kind {
         match t {
             "input" => Kind::Input,
-            "application" => Kind::Loopback,
+            // Application capture and the File Player both feed PCM into the engine
+            // over IPC (push_capture) rather than a cpal stream — both are Loopback.
+            "application" | "fileplayer" => Kind::Loopback,
             "recorder" => Kind::Recorder,
             "output" | "virtual" => Kind::Output,
             "volume" => Kind::Volume,
@@ -186,6 +196,11 @@ impl Kind {
             "chorus" => Kind::Chorus,
             "distortion" => Kind::Distortion,
             "pan" => Kind::Pan,
+            "filter" => Kind::Filter,
+            "limiter" => Kind::Limiter,
+            "expander" => Kind::Expander,
+            "tremolo" => Kind::Tremolo,
+            "bitcrusher" => Kind::Crusher,
             _ => Kind::Passthrough,
         }
     }
@@ -201,6 +216,11 @@ impl Kind {
                 | Kind::Chorus
                 | Kind::Distortion
                 | Kind::Pan
+                | Kind::Filter
+                | Kind::Limiter
+                | Kind::Expander
+                | Kind::Tremolo
+                | Kind::Crusher
         )
     }
 }
@@ -277,22 +297,49 @@ struct Edge {
     tgt_ch: usize,
 }
 
+/// An edge resolved to **integer node indices** for the audio-thread hot path:
+/// no string hashing in `eval`. `src` is an index into `GraphSnapshot::nodes`.
+#[derive(Clone)]
+struct EdgeIdx {
+    src: usize,
+    src_ch: usize,
+    tgt_ch: usize,
+}
+
 /// Immutable view the audio callbacks evaluate against. Rebuilt on any topology
 /// change and published via `ArcSwap`, so callbacks read it lock-free.
+///
+/// Nodes are stored in a flat `Vec` and addressed by a stable per-snapshot index
+/// (assigned in sorted-id order in `recompute`), so `eval` uses **direct index
+/// lookups** instead of per-node string `HashMap` hashing on the realtime thread.
 struct GraphSnapshot {
-    nodes: HashMap<String, Arc<NodeState>>,
-    /// Edges grouped by target id (the inputs feeding each node).
-    incoming: HashMap<String, Vec<Edge>>,
-    /// Recorder node ids — evaluated as extra roots so they capture even when not
-    /// routed to an output.
-    recorders: Vec<String>,
-    /// The single output that drives recorder evaluation (lowest id), so multiple
-    /// outputs don't double-record.
-    primary_output: Option<String>,
+    /// Nodes addressed by index. `id_to_idx` maps ids → these positions.
+    nodes: Vec<Arc<NodeState>>,
+    /// `incoming[i]` = the edges feeding node `i` (resolved to source indices).
+    incoming: Vec<Vec<EdgeIdx>>,
+    /// `cyclic[i]` = node `i` is part of (or only reachable through) a feedback
+    /// cycle. `eval` returns silence for these instead of recursing to MAX_DEPTH.
+    cyclic: Vec<bool>,
+    /// id → index, used **off the realtime thread** (snapshot build, resolving a
+    /// callback's own output/recorder roots once per block — never in the inner loop).
+    id_to_idx: HashMap<String, usize>,
+    /// Recorder node indices — evaluated as extra roots so they capture even when
+    /// not routed to an output.
+    recorders: Vec<usize>,
+    /// The single output index that drives recorder evaluation (lowest id), so
+    /// multiple outputs don't double-record.
+    primary_output: Option<usize>,
 }
 impl GraphSnapshot {
     fn empty() -> GraphSnapshot {
-        GraphSnapshot { nodes: HashMap::new(), incoming: HashMap::new(), recorders: Vec::new(), primary_output: None }
+        GraphSnapshot {
+            nodes: Vec::new(),
+            incoming: Vec::new(),
+            cyclic: Vec::new(),
+            id_to_idx: HashMap::new(),
+            recorders: Vec::new(),
+            primary_output: None,
+        }
     }
 }
 
@@ -318,6 +365,9 @@ struct Shared {
     // Adaptive-cushion margin bounds (ms, f32 bits), set by `set_latency_mode`.
     min_margin_ms: AtomicU32,
     max_margin_ms: AtomicU32,
+    // Output device backend: 0 = cpal shared (default), 1 = WASAPI IAudioClient3
+    // low-latency. Read when an output stream is (re)opened; set by `set_device_mode`.
+    device_mode: AtomicU32,
 }
 
 pub struct Engine {
@@ -336,6 +386,7 @@ impl Engine {
             sr: AtomicU32::new(0),
             min_margin_ms: AtomicU32::new(DEFAULT_MIN_MARGIN_MS.to_bits()),
             max_margin_ms: AtomicU32::new(DEFAULT_MAX_MARGIN_MS.to_bits()),
+            device_mode: AtomicU32::new(0),
         });
         let (tx, rx) = channel::<Command>();
         let thread_shared = shared.clone();
@@ -431,6 +482,18 @@ impl Engine {
         let (min_ms, max_ms) = latency_mode_bounds(mode);
         self.shared.min_margin_ms.store(min_ms.to_bits(), Ordering::Relaxed);
         self.shared.max_margin_ms.store(max_ms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Select the output device backend: `"lowlatency"` ⇒ WASAPI IAudioClient3 shared,
+    /// `"exclusive"` ⇒ WASAPI exclusive mode (bypasses the mixer; locks the device),
+    /// anything else ⇒ cpal shared. Read when an output stream next opens.
+    pub fn set_device_mode(&self, mode: &str) {
+        let v = match mode {
+            "lowlatency" => 1,
+            "exclusive" => 2,
+            _ => 0,
+        };
+        self.shared.device_mode.store(v, Ordering::Relaxed);
     }
 
     /// Measured input→output audio latency (ms). Per device, latency is the real
@@ -631,34 +694,83 @@ impl Engine {
             node.reset_meters();
         }
 
-        let mut incoming: HashMap<String, Vec<Edge>> = HashMap::new();
-        for e in edges.iter() {
-            // Skip edges whose endpoints/channels no longer exist.
-            let src_ok = nodes.get(&e.src).map(|n| e.src_ch < n.out_channels()).unwrap_or(false);
-            let tgt_ok = nodes.get(&e.tgt).map(|n| e.tgt_ch < n.in_channels()).unwrap_or(false);
-            if src_ok && tgt_ok {
-                incoming.entry(e.tgt.clone()).or_default().push(e.clone());
-            }
+        // Assign each node a stable index in sorted-id order, so `primary_output`
+        // (lowest id) and the layout are deterministic across rebuilds.
+        let mut ids: Vec<&String> = nodes.keys().collect();
+        ids.sort();
+        let n = ids.len();
+        let mut id_to_idx: HashMap<String, usize> = HashMap::with_capacity(n);
+        let mut node_vec: Vec<Arc<NodeState>> = Vec::with_capacity(n);
+        for (i, id) in ids.iter().enumerate() {
+            id_to_idx.insert((*id).clone(), i);
+            node_vec.push(nodes.get(*id).unwrap().clone());
         }
 
-        let recorders: Vec<String> = nodes
-            .iter()
-            .filter(|(_, n)| n.kind == Kind::Recorder)
-            .map(|(id, _)| id.clone())
-            .collect();
-        let primary_output: Option<String> = nodes
-            .iter()
-            .filter(|(_, n)| n.kind == Kind::Output)
-            .map(|(id, _)| id.clone())
-            .min();
+        // Resolve edges to indices, dropping any whose endpoints/channels no longer
+        // exist. Collect node-level (src,tgt) pairs in the same pass for cycle detection.
+        let mut incoming: Vec<Vec<EdgeIdx>> = vec![Vec::new(); n];
+        let mut node_edges: Vec<(usize, usize)> = Vec::with_capacity(edges.len());
+        for e in edges.iter() {
+            let (Some(&si), Some(&ti)) = (id_to_idx.get(&e.src), id_to_idx.get(&e.tgt)) else {
+                continue;
+            };
+            let src_ok = e.src_ch < node_vec[si].out_channels();
+            let tgt_ok = e.tgt_ch < node_vec[ti].in_channels();
+            if src_ok && tgt_ok {
+                incoming[ti].push(EdgeIdx { src: si, src_ch: e.src_ch, tgt_ch: e.tgt_ch });
+                node_edges.push((si, ti));
+            }
+        }
+        let cyclic = detect_cyclic(n, &node_edges);
+
+        let recorders: Vec<usize> =
+            (0..n).filter(|&i| node_vec[i].kind == Kind::Recorder).collect();
+        // Indices follow sorted-id order, so the first Output index is the lowest id.
+        let primary_output: Option<usize> =
+            (0..n).find(|&i| node_vec[i].kind == Kind::Output);
 
         self.shared.snapshot.store(Arc::new(GraphSnapshot {
-            nodes: nodes.clone(),
+            nodes: node_vec,
             incoming,
+            cyclic,
+            id_to_idx,
             recorders,
             primary_output,
         }));
     }
+}
+
+/// Per-node cycle flags via Kahn's topological peel over the **node-level** graph
+/// (collapsing per-channel edges). A node left unpeeled — never reaching in-degree 0 —
+/// is part of, or fed only through, a feedback cycle; `eval` silences those. Self-loops
+/// mark their own node cyclic. Duplicate edges are ignored so parallel channels between
+/// the same two nodes don't inflate in-degree.
+fn detect_cyclic(n: usize, node_edges: &[(usize, usize)]) -> Vec<bool> {
+    let mut succ: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut in_deg: Vec<usize> = vec![0; n];
+    let mut self_loop: Vec<bool> = vec![false; n];
+    let mut seen: HashSet<(usize, usize)> = HashSet::with_capacity(node_edges.len());
+    for &(s, t) in node_edges {
+        if s == t {
+            self_loop[t] = true;
+        } else if seen.insert((s, t)) {
+            succ[s].push(t);
+            in_deg[t] += 1;
+        }
+    }
+    let mut queue: VecDeque<usize> =
+        (0..n).filter(|&i| in_deg[i] == 0 && !self_loop[i]).collect();
+    let mut cyclic = vec![true; n];
+    while let Some(u) = queue.pop_front() {
+        cyclic[u] = false;
+        for &v in &succ[u] {
+            in_deg[v] -= 1;
+            if in_deg[v] == 0 && !self_loop[v] {
+                queue.push_back(v);
+            }
+        }
+    }
+    cyclic
 }
 
 impl NodeState {
@@ -707,20 +819,29 @@ struct EvalState {
     /// Free interleaved-stereo buffers; `take` pops one (reusing its capacity), `give`
     /// returns it. Grows only during warmup, then recycles.
     pool: Vec<Vec<f32>>,
-    /// `id -> (generation, popped+gained input block)`. Owned separately from the pool so
-    /// it survives the whole block for fan-out.
-    cache: HashMap<String, (u64, Vec<f32>)>,
+    /// Per node **index**: `Some((generation, popped+gained input block))`. Indexed by the
+    /// snapshot's node index (no string hashing on the hot path); owned separately from the
+    /// pool so it survives the whole block for fan-out.
+    cache: Vec<Option<(u64, Vec<f32>)>>,
     generation: u64,
 }
 
 impl EvalState {
     fn new() -> Self {
-        EvalState { pool: Vec::new(), cache: HashMap::new(), generation: 0 }
+        EvalState { pool: Vec::new(), cache: Vec::new(), generation: 0 }
     }
     /// Start a new callback block: bump the generation so last block's cache entries read
-    /// as stale (the first use of each input this block does a fresh ring pop).
-    fn begin_block(&mut self) {
+    /// as stale (the first use of each input this block does a fresh ring pop). Grows the
+    /// cache to cover every node in the current snapshot (only when it gets larger).
+    fn begin_block(&mut self, node_count: usize) {
         self.generation = self.generation.wrapping_add(1);
+        if self.cache.len() < node_count {
+            self.cache.resize_with(node_count, || None);
+        } else if self.cache.len() > node_count {
+            // Graph shrank — drop the now-unused trailing slots so destroyed nodes
+            // don't keep their cached block buffers alive at the high-water mark.
+            self.cache.truncate(node_count);
+        }
     }
     /// Borrow a zeroed `n`-sample buffer (reuses a pooled allocation when available).
     fn take(&mut self, n: usize) -> Vec<f32> {
@@ -733,32 +854,37 @@ impl EvalState {
     fn give(&mut self, b: Vec<f32>) {
         self.pool.push(b);
     }
-    /// Whether `id` has a cache entry from the current block.
-    fn cache_fresh(&self, id: &str) -> bool {
-        matches!(self.cache.get(id), Some((g, _)) if *g == self.generation)
+    /// Whether node `idx` has a cache entry from the current block.
+    fn cache_fresh(&self, idx: usize) -> bool {
+        matches!(self.cache.get(idx), Some(Some((g, _))) if *g == self.generation)
     }
-    /// Store `src` as this block's cached value for `id` (reuses the entry's capacity).
-    fn cache_store(&mut self, id: &str, src: &[f32]) {
+    /// The current-block cached block for node `idx`, if fresh-or-stale present.
+    fn cache_get(&self, idx: usize) -> Option<&Vec<f32>> {
+        self.cache.get(idx).and_then(|o| o.as_ref()).map(|(_, b)| b)
+    }
+    /// Store `src` as this block's cached value for node `idx` (reuses the entry's capacity).
+    fn cache_store(&mut self, idx: usize, src: &[f32]) {
         let g = self.generation;
-        match self.cache.get_mut(id) {
-            Some((cg, buf)) => {
-                *cg = g;
-                buf.clear();
-                buf.extend_from_slice(src);
-            }
-            None => {
-                self.cache.insert(id.to_string(), (g, src.to_vec()));
+        if let Some(slot) = self.cache.get_mut(idx) {
+            match slot {
+                Some((cg, buf)) => {
+                    *cg = g;
+                    buf.clear();
+                    buf.extend_from_slice(src);
+                }
+                None => *slot = Some((g, src.to_vec())),
             }
         }
     }
 }
 
-/// Evaluate node `id`, output channel `ch`, into an interleaved-stereo block of
+/// Evaluate node `idx`, output channel `ch`, into an interleaved-stereo block of
 /// `frames * 2` samples drawn from `st`'s buffer pool. `st.cache` pops each input exactly
 /// once per block so a fan-out from one input within this output's graph stays correct.
+/// `idx` indexes `snap.nodes`/`snap.incoming`/`snap.cyclic` directly (no string hashing).
 fn eval(
     snap: &GraphSnapshot,
-    id: &str,
+    idx: usize,
     ch: usize,
     frames: usize,
     sr: f32,
@@ -767,10 +893,12 @@ fn eval(
     depth: u32,
 ) -> Vec<f32> {
     let n = frames * 2;
-    let Some(node) = snap.nodes.get(id) else {
+    let Some(node) = snap.nodes.get(idx) else {
         return st.take(n);
     };
-    if depth > MAX_DEPTH {
+    // Feedback cycle: return silence immediately instead of recursing toward MAX_DEPTH
+    // every block. MAX_DEPTH stays as a backstop for any unexpected deep chain.
+    if depth > MAX_DEPTH || snap.cyclic.get(idx).copied().unwrap_or(false) {
         return st.take(n);
     }
 
@@ -778,9 +906,9 @@ fn eval(
     if node.kind == Kind::Input || node.kind == Kind::Loopback {
         // Fan-out within this block: reuse the already-popped (and gained) data so the
         // ring is consumed exactly once.
-        if st.cache_fresh(id) {
+        if st.cache_fresh(idx) {
             let mut out = st.take(n);
-            if let Some((_, cached)) = st.cache.get(id) {
+            if let Some(cached) = st.cache_get(idx) {
                 let m = n.min(cached.len());
                 out[..m].copy_from_slice(&cached[..m]);
             }
@@ -833,6 +961,8 @@ fn eval(
                 }
             }
         }
+        // Scalar gain — LLVM auto-vectorizes this in release (slices are non-aliasing,
+        // so no `__restrict__` needed); a hand-rolled SIMD version benchmarked slower.
         let g = node.gain_lin();
         if g != 1.0 {
             for s in b.iter_mut() {
@@ -842,19 +972,19 @@ fn eval(
         if let Some(m) = node.meters.first() {
             m.set(rms_to_db(rms(&b)));
         }
-        st.cache_store(id, &b);
+        st.cache_store(idx, &b);
         return b;
     }
 
-    let empty: Vec<Edge> = Vec::new();
-    let incoming = snap.incoming.get(id).unwrap_or(&empty);
+    let empty: Vec<EdgeIdx> = Vec::new();
+    let incoming = snap.incoming.get(idx).unwrap_or(&empty);
 
     let mut acc = st.take(n);
 
     if node.kind == Kind::Mixer {
         // Every input channel folds into the single output, each with its gain.
         for e in incoming.iter() {
-            let up = eval(snap, &e.src, e.src_ch, frames, sr, cfg, st, depth + 1);
+            let up = eval(snap, e.src, e.src_ch, frames, sr, cfg, st, depth + 1);
             let g = node
                 .mixer_gains
                 .get(e.tgt_ch)
@@ -879,7 +1009,7 @@ fn eval(
 
     // Sum every upstream feeding this output channel (Web Audio summing semantics).
     for e in incoming.iter().filter(|e| e.tgt_ch == ch) {
-        let up = eval(snap, &e.src, e.src_ch, frames, sr, cfg, st, depth + 1);
+        let up = eval(snap, e.src, e.src_ch, frames, sr, cfg, st, depth + 1);
         for i in 0..n {
             acc[i] += up[i];
         }
@@ -921,35 +1051,93 @@ fn eval(
 fn audio_thread(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Command>) {
     let host = cpal::default_host();
     let mut streams: HashMap<String, cpal::Stream> = HashMap::new();
+    // WASAPI IAudioClient3 low-latency outputs run on their own render threads (Windows
+    // only), kept here so DropStream/recreate can stop them.
+    #[cfg(windows)]
+    let mut wasapi_outs: HashMap<String, wasapi::WasapiOutput> = HashMap::new();
+    #[cfg(windows)]
+    let mut wasapi_ins: HashMap<String, wasapi::WasapiInput> = HashMap::new();
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
             Command::CreateInputStream { id, device_id } => {
                 streams.remove(&id);
-                match build_input(&host, &device_id, &shared, &id) {
-                    Ok(stream) => {
-                        if let Err(e) = stream.play() {
-                            eprintln!("[audio] input play failed: {e}");
+                let mut opened = false;
+                // Low-latency / exclusive capture uses the WASAPI default input endpoint
+                // (device_id == "" ⇒ default); any failure falls back to cpal below.
+                #[cfg(windows)]
+                {
+                    wasapi_ins.remove(&id);
+                    let mode = shared.device_mode.load(Ordering::Relaxed);
+                    if (mode == 1 || mode == 2) && device_id.is_empty() {
+                        let exclusive = mode == 2;
+                        match wasapi::WasapiInput::start(shared.clone(), id.clone(), exclusive) {
+                            Ok(w) => {
+                                wasapi_ins.insert(id.clone(), w);
+                                opened = true;
+                            }
+                            Err(e) => eprintln!(
+                                "[audio] WASAPI {} capture open failed ({e}); falling back to cpal",
+                                if exclusive { "exclusive" } else { "low-latency" }
+                            ),
                         }
-                        streams.insert(id, stream);
                     }
-                    Err(e) => eprintln!("[audio] open input '{device_id}' failed: {e}"),
+                }
+                if !opened {
+                    match build_input(&host, &device_id, &shared, &id) {
+                        Ok(stream) => {
+                            if let Err(e) = stream.play() {
+                                eprintln!("[audio] input play failed: {e}");
+                            }
+                            streams.insert(id, stream);
+                        }
+                        Err(e) => eprintln!("[audio] open input '{device_id}' failed: {e}"),
+                    }
                 }
             }
             Command::CreateOutputStream { id, device_id } => {
                 streams.remove(&id);
-                match build_output(&host, &device_id, &shared, &id) {
-                    Ok(stream) => {
-                        if let Err(e) = stream.play() {
-                            eprintln!("[audio] output play failed: {e}");
+                let mut opened = false;
+                // Low-latency mode uses the WASAPI IAudioClient3 default render endpoint
+                // (device_id == "" ⇒ default). Any failure falls back to cpal below, so
+                // the stable path is never lost.
+                #[cfg(windows)]
+                {
+                    wasapi_outs.remove(&id);
+                    let mode = shared.device_mode.load(Ordering::Relaxed);
+                    if (mode == 1 || mode == 2) && device_id.is_empty() {
+                        let exclusive = mode == 2;
+                        match wasapi::WasapiOutput::start(shared.clone(), id.clone(), exclusive) {
+                            Ok(w) => {
+                                wasapi_outs.insert(id.clone(), w);
+                                opened = true;
+                            }
+                            Err(e) => eprintln!(
+                                "[audio] WASAPI {} open failed ({e}); falling back to cpal",
+                                if exclusive { "exclusive" } else { "low-latency" }
+                            ),
                         }
-                        streams.insert(id, stream);
                     }
-                    Err(e) => eprintln!("[audio] open output '{device_id}' failed: {e}"),
+                }
+                if !opened {
+                    match build_output(&host, &device_id, &shared, &id) {
+                        Ok(stream) => {
+                            if let Err(e) = stream.play() {
+                                eprintln!("[audio] output play failed: {e}");
+                            }
+                            streams.insert(id, stream);
+                        }
+                        Err(e) => eprintln!("[audio] open output '{device_id}' failed: {e}"),
+                    }
                 }
             }
             Command::DropStream { id } => {
                 streams.remove(&id);
+                #[cfg(windows)]
+                {
+                    wasapi_outs.remove(&id);
+                    wasapi_ins.remove(&id);
+                }
             }
             Command::Shutdown => break,
         }
@@ -1147,6 +1335,62 @@ fn build_output(
     Ok(stream)
 }
 
+/// Shared output-render core used by both the cpal callback and the WASAPI render
+/// thread. Publishes the block size + sample rate, builds the cushion config, records
+/// `dev_ms` (the measured device playback latency) on the output node, and evaluates the
+/// output root plus any recording recorders. Returns an interleaved-stereo block of
+/// `frames*2` samples drawn from `st`'s pool (`give` it back after use).
+fn render_output(
+    shared: &Arc<Shared>,
+    node_id: &str,
+    st: &mut EvalState,
+    frames: usize,
+    sr: f32,
+    dev_ms: f32,
+) -> Vec<f32> {
+    shared.out_frames.store(frames as u32, Ordering::Relaxed);
+    shared.sr.store(sr as u32, Ordering::Relaxed);
+    // Per-block cushion config: one device block + the adaptive margin (clamped to the
+    // current latency-mode bounds), with a ~CLEAN_DECAY_SECS decay interval in blocks.
+    let block = shared.in_frames.load(Ordering::Relaxed).max(frames as u32) as usize;
+    let decay_blocks = if block > 0 {
+        (CLEAN_DECAY_SECS * sr / block as f32) as u32
+    } else {
+        u32::MAX
+    };
+    let cfg = CushionCfg {
+        block,
+        min_ms: f32::from_bits(shared.min_margin_ms.load(Ordering::Relaxed)),
+        max_ms: f32::from_bits(shared.max_margin_ms.load(Ordering::Relaxed)),
+        decay_blocks,
+    };
+    let snap = shared.snapshot.load();
+    st.begin_block(snap.nodes.len());
+
+    // Resolve this output's node index once per block; `None` if just removed → silence.
+    let root = snap.id_to_idx.get(node_id).copied();
+    if let Some(node) = root.and_then(|i| snap.nodes.get(i)) {
+        node.dev_latency.store(dev_ms.to_bits(), Ordering::Relaxed);
+    }
+
+    let stereo = match root {
+        Some(idx) => eval(&snap, idx, 0, frames, sr, cfg, st, 0),
+        None => st.take(frames * 2),
+    };
+
+    // Drive recording recorders as extra roots (so they capture even when not routed
+    // to an output). Only the primary output does this, to avoid double-recording.
+    if root.is_some() && snap.primary_output == root {
+        for &ridx in &snap.recorders {
+            if snap.nodes[ridx].recording.load(Ordering::Relaxed) {
+                let r = eval(&snap, ridx, 0, frames, sr, cfg, st, 0);
+                st.give(r);
+            }
+        }
+    }
+    stereo
+}
+
 fn output_cb<T>(
     out_ch: usize,
     sr: f32,
@@ -1160,50 +1404,15 @@ where
     let mut st = EvalState::new();
     move |data: &mut [T], info: &OutputCallbackInfo| {
         let frames = (data.len() / out_ch).min(MAX_BLOCK_FRAMES);
-        shared.out_frames.store(frames as u32, Ordering::Relaxed);
-        shared.sr.store(sr as u32, Ordering::Relaxed);
-        // Per-block cushion config: one device block + the adaptive margin (clamped to the
-        // current latency-mode bounds), with a ~CLEAN_DECAY_SECS decay interval in blocks.
-        let block = shared.in_frames.load(Ordering::Relaxed).max(frames as u32) as usize;
-        let decay_blocks = if block > 0 {
-            (CLEAN_DECAY_SECS * sr / block as f32) as u32
-        } else {
-            u32::MAX
-        };
-        let cfg = CushionCfg {
-            block,
-            min_ms: f32::from_bits(shared.min_margin_ms.load(Ordering::Relaxed)),
-            max_ms: f32::from_bits(shared.max_margin_ms.load(Ordering::Relaxed)),
-            decay_blocks,
-        };
-        let snap = shared.snapshot.load();
-        st.begin_block();
-
         // Real output device latency: how far ahead of "now" this block plays out
         // (cpal callback→playback, i.e. the live buffer padding). Block-size fallback.
-        if let Some(node) = snap.nodes.get(&node_id) {
-            let ts = info.timestamp();
-            let dev_ms = ts
-                .playback
-                .duration_since(&ts.callback)
-                .map(|d| d.as_secs_f32() * 1000.0)
-                .unwrap_or(frames as f32 / sr * 1000.0);
-            node.dev_latency.store(dev_ms.to_bits(), Ordering::Relaxed);
-        }
-
-        let stereo = eval(&snap, &node_id, 0, frames, sr, cfg, &mut st, 0);
-
-        // Drive recording recorders as extra roots (so they capture even when not
-        // routed to an output). Only the primary output does this, to avoid
-        // double-recording when several outputs run.
-        if snap.primary_output.as_deref() == Some(node_id.as_str()) {
-            for rid in &snap.recorders {
-                if snap.nodes.get(rid).map(|n| n.recording.load(Ordering::Relaxed)).unwrap_or(false) {
-                    let r = eval(&snap, rid, 0, frames, sr, cfg, &mut st, 0);
-                    st.give(r);
-                }
-            }
-        }
+        let ts = info.timestamp();
+        let dev_ms = ts
+            .playback
+            .duration_since(&ts.callback)
+            .map(|d| d.as_secs_f32() * 1000.0)
+            .unwrap_or(frames as f32 / sr * 1000.0);
+        let stereo = render_output(&shared, &node_id, &mut st, frames, sr, dev_ms);
 
         for i in 0..frames {
             let l = stereo[2 * i];
@@ -1220,5 +1429,47 @@ where
             }
         }
         st.give(stereo);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::detect_cyclic;
+
+    #[test]
+    fn dag_has_no_cycles() {
+        // 0→1→2 and 0→2 (a diamond-ish DAG): nothing cyclic.
+        assert_eq!(detect_cyclic(3, &[(0, 1), (1, 2), (0, 2)]), vec![false, false, false]);
+    }
+
+    #[test]
+    fn simple_cycle_is_exactly_the_loop_members() {
+        // 0→1→2→1: 1 and 2 form a cycle; the source 0 stays clean.
+        assert_eq!(detect_cyclic(3, &[(0, 1), (1, 2), (2, 1)]), vec![false, true, true]);
+    }
+
+    #[test]
+    fn self_loop_marks_only_its_node() {
+        // 0→0 (self feedback); node 1 is independent → only node 0 is silenced.
+        assert_eq!(detect_cyclic(2, &[(0, 0)]), vec![true, false]);
+    }
+
+    #[test]
+    fn self_loop_silences_downstream_too() {
+        // 0→0 self feedback then 0→1: node 1 is fed only through the stuck node 0,
+        // so it silences too (matches the old MAX_DEPTH recursion behaviour).
+        assert_eq!(detect_cyclic(2, &[(0, 0), (0, 1)]), vec![true, true]);
+    }
+
+    #[test]
+    fn node_fed_only_through_a_cycle_is_cyclic() {
+        // 0↔1 cycle, and 1→2: 2 can never be reached in topo order, so it silences too.
+        assert_eq!(detect_cyclic(3, &[(0, 1), (1, 0), (1, 2)]), vec![true, true, true]);
+    }
+
+    #[test]
+    fn parallel_edges_between_two_nodes_are_not_a_cycle() {
+        // Two channels 0→1 (duplicate node-level edge) must not look like a cycle.
+        assert_eq!(detect_cyclic(2, &[(0, 1), (0, 1)]), vec![false, false]);
     }
 }

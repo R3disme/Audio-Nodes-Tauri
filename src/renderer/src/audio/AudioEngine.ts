@@ -16,6 +16,7 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { AudioBackend } from './AudioBackend'
+import { resolveDeviceId } from '@renderer/lib/deviceMatch'
 
 export type AudioNodeType =
   | 'input'
@@ -34,6 +35,11 @@ export type AudioNodeType =
   | 'pan'
   | 'recorder'
   | 'fileplayer'
+  | 'filter'
+  | 'limiter'
+  | 'expander'
+  | 'tremolo'
+  | 'bitcrusher'
 
 export interface EQBand {
   frequency: number
@@ -59,12 +65,24 @@ export interface DelayParams { time: number; feedback: number; mix: number }
 export interface ChorusParams { rate: number; depth: number; mix: number }
 export interface DistortionParams { drive: number; mix: number }
 export interface PanParams { pan: number }
+// Filter type: 0 = low-pass, 1 = high-pass, 2 = band-pass, 3 = notch.
+export interface FilterParams { type: number; cutoff: number; q: number }
+export interface LimiterParams { threshold: number; release: number }
+export interface ExpanderParams { threshold: number; ratio: number; attack: number; release: number }
+// Tremolo mode: 0 = amplitude (tremolo), 1 = stereo position (auto-pan). Shape: 0 = sine, 1 = triangle.
+export interface TremoloParams { mode: number; shape: number; rate: number; depth: number }
+export interface CrusherParams { bits: number; downsample: number; mix: number }
 
 export const DEFAULT_REVERB: ReverbParams = { mix: 0.3, decay: 2.2, preDelay: 0.02 }
 export const DEFAULT_DELAY: DelayParams = { time: 0.3, feedback: 0.35, mix: 0.35 }
 export const DEFAULT_CHORUS: ChorusParams = { rate: 1.5, depth: 0.003, mix: 0.4 }
 export const DEFAULT_DISTORTION: DistortionParams = { drive: 5, mix: 0.5 }
 export const DEFAULT_PAN: PanParams = { pan: 0 }
+export const DEFAULT_FILTER: FilterParams = { type: 0, cutoff: 1000, q: 0.707 }
+export const DEFAULT_LIMITER: LimiterParams = { threshold: -1, release: 0.1 }
+export const DEFAULT_EXPANDER: ExpanderParams = { threshold: -40, ratio: 2, attack: 0.005, release: 0.1 }
+export const DEFAULT_TREMOLO: TremoloParams = { mode: 0, shape: 0, rate: 5, depth: 0.7 }
+export const DEFAULT_CRUSHER: CrusherParams = { bits: 8, downsample: 1, mix: 1 }
 
 // ── Internal node representation ───────────────────────────────────────────
 
@@ -101,6 +119,16 @@ interface ManagedNode {
   distortionParams?: DistortionParams
   panRefs?: PanChannel[]
   panParams?: PanParams
+  filterRefs?: BiquadFilterNode[]
+  filterParams?: FilterParams
+  limiterRefs?: DynamicsCompressorNode[]
+  limiterParams?: LimiterParams
+  expanderRefs?: ExpanderChannel[]
+  expanderParams?: ExpanderParams
+  tremoloRefs?: TremoloChannel[]
+  tremoloParams?: TremoloParams
+  crusherRefs?: CrusherChannel[]
+  crusherParams?: CrusherParams
 
   mediaStream?: MediaStream
 
@@ -118,6 +146,8 @@ interface ManagedNode {
   // so it can be routed to an independent device via the element's setSinkId.
   outputSink?: HTMLAudioElement
   outputDeviceId?: string
+  // Persisted device label — the stable key for reconnecting when the id changes.
+  outputDeviceName?: string
 
   // For recorder: a MediaStreamDestination tapped by a MediaRecorder. The
   // recorder is created lazily on the first record so an idle node is cheap.
@@ -135,6 +165,8 @@ interface ManagedNode {
 
   // For input device auto-recovery:
   inputDeviceId?: string
+  // Persisted device label — the stable key for reconnecting when the id changes.
+  inputDeviceName?: string
   inputActive?: boolean
   inputReconnectTimer?: number
 }
@@ -147,6 +179,78 @@ interface GateChannel {
   attack: number
   release: number
 }
+
+// Downward expander — like the gate, but a soft ratio-based attenuation below
+// threshold rather than a hard cut. Driven by the same meter rAF loop (tickExpander).
+interface ExpanderChannel {
+  monitor: AnalyserNode
+  gain: GainNode
+  buf: Float32Array<ArrayBuffer>
+  threshold: number
+  ratio: number
+  attack: number
+  release: number
+}
+
+// Tremolo / auto-pan — an OscillatorNode LFO drives either the amplitude GainNode
+// (tremolo) or the StereoPanner (auto-pan), so modulation is sample-accurate with
+// no main-thread work. `lfo` scales the oscillator to the active depth.
+interface TremoloChannel {
+  input: GainNode
+  amp: GainNode
+  panner: StereoPannerNode
+  osc: OscillatorNode
+  lfo: GainNode
+  mode: number
+  shape: number
+  rate: number
+  depth: number
+}
+
+// Bitcrusher — bit-depth quantize + sample-rate decimation. Web Audio has no native
+// crusher, so an AudioWorklet (loaded once from a Blob URL) does the per-sample
+// hold/quantize off the main thread. `proc` is null only if the worklet failed to load
+// (then the channel is a passthrough).
+interface CrusherChannel {
+  input: GainNode
+  proc: AudioWorkletNode | null
+}
+
+// The crusher's AudioWorklet processor, loaded as a Blob module in init(). bits/downsample/
+// mix are k-rate AudioParams; the per-frame decimation counter + sample-hold live here.
+const BITCRUSHER_WORKLET = `
+class BitcrusherProcessor extends AudioWorkletProcessor {
+  static get parameterDescriptors() {
+    return [
+      { name: 'bits', defaultValue: 8, minValue: 1, maxValue: 16, automationRate: 'k-rate' },
+      { name: 'downsample', defaultValue: 1, minValue: 1, maxValue: 64, automationRate: 'k-rate' },
+      { name: 'mix', defaultValue: 1, minValue: 0, maxValue: 1, automationRate: 'k-rate' }
+    ]
+  }
+  constructor() { super(); this.hold = []; this.counter = 0 }
+  process(inputs, outputs, params) {
+    const input = inputs[0], output = outputs[0]
+    if (!input || input.length === 0) return true
+    const bits = Math.max(1, Math.min(16, params.bits[0]))
+    const ds = Math.max(1, params.downsample[0])
+    const mix = params.mix[0], dry = 1 - mix
+    const half = Math.max(1, Math.pow(2, bits) / 2)
+    const frames = input[0].length
+    for (let i = 0; i < frames; i++) {
+      this.counter += 1
+      const sample = this.counter >= ds
+      if (sample) this.counter -= ds
+      for (let c = 0; c < input.length; c++) {
+        if (this.hold[c] === undefined) this.hold[c] = 0
+        if (sample) this.hold[c] = Math.round(input[c][i] * half) / half
+        output[c][i] = input[c][i] * dry + this.hold[c] * mix
+      }
+    }
+    return true
+  }
+}
+registerProcessor('bitcrusher-processor', BitcrusherProcessor)
+`
 
 // ── Creative-effect channel structures ──────────────────────────────────────
 // Each effect mixes a dry and a wet path into the channel's output meter:
@@ -213,11 +317,24 @@ class AudioEngine implements AudioBackend {
   private rafId: number | null = null
   // Explicit ArrayBuffer backing — getFloatTimeDomainData requires Float32Array<ArrayBuffer>
   private rmsBuf: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(256 * 4))
+  /** Set once the bitcrusher AudioWorklet module has loaded. */
+  private bitcrusherReady = false
 
   async init(): Promise<void> {
     if (this.ctx) return
     this.ctx = new AudioContext({ latencyHint: 'interactive' })
     if (this.ctx.state === 'suspended') await this.ctx.resume()
+    // Load the bitcrusher worklet from a Blob URL (no asset-path dependency, works
+    // under file:// in the packaged app). Best-effort — the node falls back to
+    // passthrough if it can't load.
+    try {
+      const url = URL.createObjectURL(new Blob([BITCRUSHER_WORKLET], { type: 'application/javascript' }))
+      await this.ctx.audioWorklet.addModule(url)
+      URL.revokeObjectURL(url)
+      this.bitcrusherReady = true
+    } catch (e) {
+      console.warn('Bitcrusher worklet failed to load; bitcrusher will pass through:', e)
+    }
     this.startMeterLoop()
   }
 
@@ -235,7 +352,12 @@ class AudioEngine implements AudioBackend {
       this.meterSubs.set(key, set)
     }
     set.add(cb)
-    return () => set!.delete(cb)
+    // Drop the key when the last subscriber leaves so a long session of
+    // create/destroy doesn't accumulate empty Sets keyed by stale node ids.
+    return () => {
+      set!.delete(cb)
+      if (set!.size === 0) this.meterSubs.delete(key)
+    }
   }
 
   private startMeterLoop(): void {
@@ -248,6 +370,8 @@ class AudioEngine implements AudioBackend {
         this.nodes.forEach((node) => {
           if (node.type === 'gate' && node.gateRefs) {
             for (const g of node.gateRefs) this.tickGate(g)
+          } else if (node.type === 'expander' && node.expanderRefs) {
+            for (const e of node.expanderRefs) this.tickExpander(e)
           }
         })
         this.rafId = requestAnimationFrame(tick)
@@ -270,9 +394,11 @@ class AudioEngine implements AudioBackend {
           for (const cb of subs) cb(db)
         })
 
-        // Tick gate state machines from the audio-rate input level
+        // Tick gate / expander state machines from the audio-rate input level
         if (node.type === 'gate' && node.gateRefs) {
           for (const g of node.gateRefs) this.tickGate(g)
+        } else if (node.type === 'expander' && node.expanderRefs) {
+          for (const e of node.expanderRefs) this.tickExpander(e)
         }
       })
       this.rafId = requestAnimationFrame(tick)
@@ -289,6 +415,20 @@ class AudioEngine implements AudioBackend {
     const target = db >= g.threshold ? 1 : 0
     const tau = target > 0 ? g.attack : g.release
     g.gain.gain.setTargetAtTime(target, this.context.currentTime, Math.max(0.001, tau))
+  }
+
+  private tickExpander(e: ExpanderChannel): void {
+    e.monitor.getFloatTimeDomainData(e.buf)
+    let sum = 0
+    for (let i = 0; i < e.buf.length; i++) sum += e.buf[i] * e.buf[i]
+    const rms = Math.sqrt(sum / e.buf.length)
+    const db = rms > 1e-7 ? 20 * Math.log10(rms) : -120
+    // Below threshold: attenuate by (ratio-1)·(db-threshold) dB; above: unity.
+    const reductionDb = db < e.threshold ? (Math.max(1, e.ratio) - 1) * (db - e.threshold) : 0
+    const target = Math.pow(10, reductionDb / 20)
+    // More attenuation = the "attack" direction (closing), recovery = "release".
+    const tau = target < 1 ? e.attack : e.release
+    e.gain.gain.setTargetAtTime(target, this.context.currentTime, Math.max(0.001, tau))
   }
 
   private makeAnalyser(): AnalyserNode {
@@ -308,7 +448,7 @@ class AudioEngine implements AudioBackend {
 
   // ── Input device ────────────────────────────────────────────────────────
 
-  async createInputNode(id: string, deviceId?: string): Promise<void> {
+  async createInputNode(id: string, deviceId?: string, deviceName?: string): Promise<void> {
     await this.init()
     const existing = this.nodes.get(id)
     existing?.mediaStream?.getTracks().forEach(t => t.stop())
@@ -353,6 +493,7 @@ class AudioEngine implements AudioBackend {
       existing.meters = [analyser]
       existing.gainRefs = [gain]
       existing.inputDeviceId = deviceId
+      if (deviceName !== undefined) existing.inputDeviceName = deviceName
       existing.inputActive = true
       this.notifyNodeSubs()
       return
@@ -366,6 +507,7 @@ class AudioEngine implements AudioBackend {
       gainRefs: [gain],
       mediaStream: stream,
       inputDeviceId: deviceId,
+      inputDeviceName: deviceName,
       inputActive: true
     })
     this.notifyNodeSubs()
@@ -382,13 +524,16 @@ class AudioEngine implements AudioBackend {
       const current = this.nodes.get(id)
       if (!current || current.type !== 'input') return
       try {
-        // If a specific device was chosen, only retry once it's present again.
+        // If a specific device was chosen, only retry once it (or a same-named
+        // endpoint with a churned id) is present again, then reconnect to it.
         if (current.inputDeviceId) {
           const devices = await navigator.mediaDevices.enumerateDevices()
-          const present = devices.some(d => d.kind === 'audioinput' && d.deviceId === current.inputDeviceId)
-          if (!present) { this.scheduleInputReconnect(id); return }
+          const resolved = resolveDeviceId(devices, current.inputDeviceId, current.inputDeviceName, 'audioinput')
+          if (resolved === undefined) { this.scheduleInputReconnect(id); return }
+          await this.createInputNode(id, resolved, current.inputDeviceName)
+          return
         }
-        await this.createInputNode(id, current.inputDeviceId)
+        await this.createInputNode(id, current.inputDeviceId, current.inputDeviceName)
       } catch {
         this.scheduleInputReconnect(id)
       }
@@ -565,10 +710,11 @@ class AudioEngine implements AudioBackend {
     this.notifyNodeSubs()
   }
 
-  async setOutputDevice(id: string, deviceId: string): Promise<void> {
+  async setOutputDevice(id: string, deviceId: string, deviceName?: string): Promise<void> {
     const node = this.nodes.get(id)
     if (!node?.outputSink) return
     node.outputDeviceId = deviceId
+    if (deviceName !== undefined) node.outputDeviceName = deviceName
     // Virtual Output stays silent until a real cable is selected (see createOutputNode).
     if (node.type === 'virtual') node.outputSink.muted = !deviceId
     try {
@@ -581,11 +727,20 @@ class AudioEngine implements AudioBackend {
 
   /** Re-apply each output's chosen device + resume playback after a devicechange. */
   async recoverOutputs(): Promise<void> {
+    const devices = await navigator.mediaDevices.enumerateDevices().catch(() => [] as MediaDeviceInfo[])
     for (const node of this.nodes.values()) {
       const el = node.outputSink
       if (!el) continue
       try {
-        if (node.outputDeviceId) await el.setSinkId(node.outputDeviceId || '')
+        if (node.outputDeviceId) {
+          // Re-resolve in case the id churned; fall back to the saved label.
+          const resolved = resolveDeviceId(devices, node.outputDeviceId, node.outputDeviceName, 'audiooutput')
+          if (resolved !== undefined) {
+            node.outputDeviceId = resolved
+            await el.setSinkId(resolved)
+          }
+          // else: not present yet — keep the current sink, retry on next devicechange.
+        }
         if (el.paused) await el.play()
       } catch { /* device not ready yet — will retry on next devicechange */ }
     }
@@ -748,6 +903,7 @@ class AudioEngine implements AudioBackend {
 
   /** Web Audio latency isn't tunable this way — no-op (satisfies the backend interface). */
   setLatencyMode(_mode: 'low' | 'balanced' | 'safe'): void {}
+  setDeviceMode(_mode: 'shared' | 'lowlatency' | 'exclusive'): void {}
 
   // ── Effect: Volume (multi-channel) ──────────────────────────────────────
 
@@ -1241,6 +1397,244 @@ class AudioEngine implements AudioBackend {
     for (const ch of node.panRefs) ch.panner.pan.setTargetAtTime(pan, t, 0.02)
   }
 
+  // ── Effect: Filter (standalone biquad, multi-channel) ───────────────────
+
+  private filterTypeName(t: number): BiquadFilterType {
+    return (['lowpass', 'highpass', 'bandpass', 'notch'] as const)[Math.max(0, Math.min(3, Math.round(t)))]
+  }
+
+  createFilterNode(id: string, channels = 1, params: FilterParams = DEFAULT_FILTER): void {
+    const ctx = this.context
+    const inputs: AudioNode[] = []
+    const outputs: AudioNode[] = []
+    const meters: AnalyserNode[] = []
+    const refs: BiquadFilterNode[] = []
+
+    for (let i = 0; i < channels; i++) {
+      const filter = ctx.createBiquadFilter()
+      filter.type = this.filterTypeName(params.type)
+      filter.frequency.value = params.cutoff
+      filter.Q.value = params.q
+      const meter = this.makeAnalyser()
+      filter.connect(meter)
+      refs.push(filter)
+      inputs.push(filter); outputs.push(meter); meters.push(meter)
+    }
+
+    this.nodes.set(id, { type: 'filter', inputs, outputs, meters, filterRefs: refs, filterParams: { ...params } })
+    this.notifyNodeSubs()
+  }
+
+  setFilter(id: string, params: Partial<FilterParams>): void {
+    const node = this.nodes.get(id)
+    if (!node?.filterRefs || !node.filterParams) return
+    const p = node.filterParams
+    if (params.type !== undefined) p.type = params.type
+    if (params.cutoff !== undefined) p.cutoff = params.cutoff
+    if (params.q !== undefined) p.q = params.q
+    const t = this.context.currentTime
+    for (const f of node.filterRefs) {
+      if (params.type !== undefined) f.type = this.filterTypeName(p.type)
+      if (params.cutoff !== undefined) f.frequency.setTargetAtTime(p.cutoff, t, 0.02)
+      if (params.q !== undefined) f.Q.setTargetAtTime(p.q, t, 0.02)
+    }
+  }
+
+  // ── Effect: Limiter (brickwall, via a high-ratio DynamicsCompressor) ────
+
+  createLimiterNode(id: string, channels = 1, params: LimiterParams = DEFAULT_LIMITER): void {
+    const ctx = this.context
+    const inputs: AudioNode[] = []
+    const outputs: AudioNode[] = []
+    const meters: AnalyserNode[] = []
+    const refs: DynamicsCompressorNode[] = []
+
+    for (let i = 0; i < channels; i++) {
+      const comp = ctx.createDynamicsCompressor()
+      comp.threshold.value = params.threshold
+      comp.knee.value = 0          // hard knee → brickwall-ish
+      comp.ratio.value = 20        // max ratio
+      comp.attack.value = 0.001    // fast, to catch peaks
+      comp.release.value = params.release
+      const meter = this.makeAnalyser()
+      comp.connect(meter)
+      refs.push(comp)
+      inputs.push(comp); outputs.push(meter); meters.push(meter)
+    }
+
+    this.nodes.set(id, { type: 'limiter', inputs, outputs, meters, limiterRefs: refs, limiterParams: { ...params } })
+    this.notifyNodeSubs()
+  }
+
+  setLimiter(id: string, params: Partial<LimiterParams>): void {
+    const node = this.nodes.get(id)
+    if (!node?.limiterRefs || !node.limiterParams) return
+    const p = node.limiterParams
+    if (params.threshold !== undefined) p.threshold = params.threshold
+    if (params.release !== undefined) p.release = params.release
+    const t = this.context.currentTime
+    for (const c of node.limiterRefs) {
+      if (params.threshold !== undefined) c.threshold.setTargetAtTime(p.threshold, t, 0.01)
+      if (params.release !== undefined) c.release.setTargetAtTime(p.release, t, 0.01)
+    }
+  }
+
+  // ── Effect: Expander (downward, meter-driven gain — see tickExpander) ───
+
+  createExpanderNode(id: string, channels = 1, params: ExpanderParams = DEFAULT_EXPANDER): void {
+    const ctx = this.context
+    const inputs: AudioNode[] = []
+    const outputs: AudioNode[] = []
+    const meters: AnalyserNode[] = []
+    const refs: ExpanderChannel[] = []
+
+    for (let i = 0; i < channels; i++) {
+      const entry = ctx.createGain()
+      const monitor = ctx.createAnalyser()
+      monitor.fftSize = 256
+      const expGain = ctx.createGain()
+      expGain.gain.value = 1
+      const meter = this.makeAnalyser()
+      entry.connect(monitor)
+      entry.connect(expGain)
+      expGain.connect(meter)
+      refs.push({
+        monitor, gain: expGain,
+        buf: new Float32Array(new ArrayBuffer(monitor.fftSize * 4)),
+        threshold: params.threshold, ratio: params.ratio, attack: params.attack, release: params.release
+      })
+      inputs.push(entry); outputs.push(meter); meters.push(meter)
+    }
+
+    this.nodes.set(id, { type: 'expander', inputs, outputs, meters, expanderRefs: refs, expanderParams: { ...params } })
+    this.notifyNodeSubs()
+  }
+
+  setExpander(id: string, params: Partial<ExpanderParams>): void {
+    const node = this.nodes.get(id)
+    if (!node?.expanderRefs || !node.expanderParams) return
+    const p = node.expanderParams
+    if (params.threshold !== undefined) p.threshold = params.threshold
+    if (params.ratio !== undefined) p.ratio = params.ratio
+    if (params.attack !== undefined) p.attack = params.attack
+    if (params.release !== undefined) p.release = params.release
+    for (const e of node.expanderRefs) {
+      if (params.threshold !== undefined) e.threshold = p.threshold
+      if (params.ratio !== undefined) e.ratio = p.ratio
+      if (params.attack !== undefined) e.attack = p.attack
+      if (params.release !== undefined) e.release = p.release
+    }
+  }
+
+  // ── Effect: Tremolo / Auto-pan (OscillatorNode LFO) ─────────────────────
+
+  private wireTremolo(ch: TremoloChannel): void {
+    // Re-point the LFO to the active target and neutralize the idle one.
+    try { ch.lfo.disconnect() } catch { /* not connected yet */ }
+    ch.osc.type = ch.shape === 1 ? 'triangle' : 'sine'
+    ch.osc.frequency.value = ch.rate
+    const d = Math.max(0, Math.min(1, ch.depth))
+    if (ch.mode === 1) {
+      // Auto-pan: amplitude flat, LFO drives pan over [-depth, depth].
+      ch.amp.gain.value = 1
+      ch.panner.pan.value = 0
+      ch.lfo.gain.value = d
+      ch.lfo.connect(ch.panner.pan)
+    } else {
+      // Tremolo: pan centred, amplitude oscillates in [1-depth, 1].
+      ch.panner.pan.value = 0
+      ch.amp.gain.value = 1 - d / 2
+      ch.lfo.gain.value = d / 2
+      ch.lfo.connect(ch.amp.gain)
+    }
+  }
+
+  createTremoloNode(id: string, channels = 1, params: TremoloParams = DEFAULT_TREMOLO): void {
+    const ctx = this.context
+    const inputs: AudioNode[] = []
+    const outputs: AudioNode[] = []
+    const meters: AnalyserNode[] = []
+    const refs: TremoloChannel[] = []
+
+    for (let i = 0; i < channels; i++) {
+      const input = ctx.createGain()
+      const amp = ctx.createGain()
+      const panner = ctx.createStereoPanner()
+      const osc = ctx.createOscillator()
+      const lfo = ctx.createGain()
+      const meter = this.makeAnalyser()
+      input.connect(amp); amp.connect(panner); panner.connect(meter)
+      osc.connect(lfo)
+      const ch: TremoloChannel = { input, amp, panner, osc, lfo, ...params }
+      this.wireTremolo(ch)
+      osc.start()
+      refs.push(ch)
+      inputs.push(input); outputs.push(meter); meters.push(meter)
+    }
+
+    this.nodes.set(id, { type: 'tremolo', inputs, outputs, meters, tremoloRefs: refs, tremoloParams: { ...params } })
+    this.notifyNodeSubs()
+  }
+
+  setTremolo(id: string, params: Partial<TremoloParams>): void {
+    const node = this.nodes.get(id)
+    if (!node?.tremoloRefs || !node.tremoloParams) return
+    const p = node.tremoloParams
+    if (params.mode !== undefined) p.mode = params.mode
+    if (params.shape !== undefined) p.shape = params.shape
+    if (params.rate !== undefined) p.rate = params.rate
+    if (params.depth !== undefined) p.depth = params.depth
+    for (const ch of node.tremoloRefs) {
+      ch.mode = p.mode; ch.shape = p.shape; ch.rate = p.rate; ch.depth = p.depth
+      this.wireTremolo(ch)
+    }
+  }
+
+  // ── Effect: Bitcrusher (ScriptProcessor: quantize + decimate) ───────────
+
+  createBitcrusherNode(id: string, channels = 1, params: CrusherParams = DEFAULT_CRUSHER): void {
+    const ctx = this.context
+    const inputs: AudioNode[] = []
+    const outputs: AudioNode[] = []
+    const meters: AnalyserNode[] = []
+    const refs: CrusherChannel[] = []
+
+    for (let i = 0; i < channels; i++) {
+      const input = ctx.createGain()
+      const meter = this.makeAnalyser()
+      let proc: AudioWorkletNode | null = null
+      if (this.bitcrusherReady) {
+        proc = new AudioWorkletNode(ctx, 'bitcrusher-processor', {
+          parameterData: { bits: params.bits, downsample: params.downsample, mix: params.mix }
+        })
+        input.connect(proc); proc.connect(meter)
+      } else {
+        input.connect(meter) // worklet unavailable → passthrough
+      }
+      refs.push({ input, proc })
+      inputs.push(input); outputs.push(meter); meters.push(meter)
+    }
+
+    this.nodes.set(id, { type: 'bitcrusher', inputs, outputs, meters, crusherRefs: refs, crusherParams: { ...params } })
+    this.notifyNodeSubs()
+  }
+
+  setBitcrusher(id: string, params: Partial<CrusherParams>): void {
+    const node = this.nodes.get(id)
+    if (!node?.crusherRefs || !node.crusherParams) return
+    const p = node.crusherParams
+    if (params.bits !== undefined) p.bits = params.bits
+    if (params.downsample !== undefined) p.downsample = params.downsample
+    if (params.mix !== undefined) p.mix = params.mix
+    const t = this.context.currentTime
+    for (const ch of node.crusherRefs) {
+      if (!ch.proc) continue
+      if (params.bits !== undefined) ch.proc.parameters.get('bits')?.setValueAtTime(p.bits, t)
+      if (params.downsample !== undefined) ch.proc.parameters.get('downsample')?.setValueAtTime(p.downsample, t)
+      if (params.mix !== undefined) ch.proc.parameters.get('mix')?.setValueAtTime(p.mix, t)
+    }
+  }
+
   // ── Channel reconfiguration (add/remove channels) ─────────────────────
 
   /**
@@ -1314,6 +1708,11 @@ class AudioEngine implements AudioBackend {
       case 'chorus':     this.createChorusNode(id, channels, node.chorusParams ?? DEFAULT_CHORUS); break
       case 'distortion': this.createDistortionNode(id, channels, node.distortionParams ?? DEFAULT_DISTORTION); break
       case 'pan':        this.createPanNode(id, channels, node.panParams ?? DEFAULT_PAN); break
+      case 'filter':     this.createFilterNode(id, channels, node.filterParams ?? DEFAULT_FILTER); break
+      case 'limiter':    this.createLimiterNode(id, channels, node.limiterParams ?? DEFAULT_LIMITER); break
+      case 'expander':   this.createExpanderNode(id, channels, node.expanderParams ?? DEFAULT_EXPANDER); break
+      case 'tremolo':    this.createTremoloNode(id, channels, node.tremoloParams ?? DEFAULT_TREMOLO); break
+      case 'bitcrusher': this.createBitcrusherNode(id, channels, node.crusherParams ?? DEFAULT_CRUSHER); break
       default:
         return current
     }
@@ -1417,6 +1816,19 @@ class AudioEngine implements AudioBackend {
       for (const ch of node.chorusRefs) {
         try { ch.lfo.stop() } catch {}
         try { ch.lfo.disconnect() } catch {}
+      }
+    }
+    // Stop tremolo/auto-pan LFO oscillators so they don't keep running detached.
+    if (node.tremoloRefs) {
+      for (const ch of node.tremoloRefs) {
+        try { ch.osc.stop() } catch {}
+        try { ch.osc.disconnect(); ch.lfo.disconnect() } catch {}
+      }
+    }
+    // Detach bitcrusher worklet nodes so they stop pulling audio once replaced.
+    if (node.crusherRefs) {
+      for (const ch of node.crusherRefs) {
+        try { ch.proc?.disconnect() } catch { /* */ }
       }
     }
   }

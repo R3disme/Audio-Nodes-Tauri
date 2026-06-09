@@ -226,6 +226,8 @@ function AudioSection(): JSX.Element {
   const setEngine = useSettingsStore(s => s.setEngine)
   const latencyMode = useSettingsStore(s => s.latencyMode)
   const setLatencyMode = useSettingsStore(s => s.setLatencyMode)
+  const deviceMode = useSettingsStore(s => s.deviceMode)
+  const setDeviceMode = useSettingsStore(s => s.setDeviceMode)
   const native = engine === 'native'
 
   // Live latency readout (same poll cadence as the toolbar).
@@ -302,6 +304,40 @@ function AudioSection(): JSX.Element {
           </p>
         )}
       </div>
+
+      {/* Output device backend (native only) */}
+      {native && (
+        <div>
+          <div className="text-[10px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--c-text-dim)' }}>Output backend</div>
+          <div className="flex rounded overflow-hidden ring-1 ring-black/40 text-[10px] font-semibold">
+            {([
+              { id: 'shared', label: 'Shared', title: 'Standard shared-mode output (stable, most compatible)' },
+              { id: 'lowlatency', label: 'Low-latency', title: 'WASAPI IAudioClient3 shared low-latency — helps only if the device exposes a small shared period' },
+              { id: 'exclusive', label: 'Exclusive', title: 'WASAPI exclusive mode — bypasses the Windows mixer for the lowest latency, but LOCKS the output device' }
+            ] as const).map(m => (
+              <button
+                key={m.id}
+                onClick={() => setDeviceMode(m.id)}
+                title={m.title}
+                className="px-2.5 py-1 transition-colors"
+                style={{
+                  background: deviceMode === m.id ? 'var(--c-accent)' : 'var(--c-surface-2)',
+                  color: deviceMode === m.id ? '#1a1a1a' : 'var(--c-text-dim)'
+                }}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+          <p className="text-[10px] mt-2 leading-snug" style={{ color: 'var(--c-text-dim)' }}>
+            {deviceMode === 'exclusive'
+              ? 'WASAPI exclusive output — bypasses the mixer for the lowest latency, default endpoint only. Locks the device: no app-capture/loopback or sharing on it while active. Reloads on change; falls back to shared if the device refuses it.'
+              : deviceMode === 'lowlatency'
+              ? 'WASAPI IAudioClient3 shared low-latency, default endpoint only. Only lower if your device exposes a small shared period (most built-in audio doesn’t). Reloads on change; falls back to shared.'
+              : 'Standard shared-mode output via cpal. Most compatible.'}
+          </p>
+        </div>
+      )}
     </div>
   )
 }

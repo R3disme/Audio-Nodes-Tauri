@@ -25,6 +25,11 @@ pub enum Dsp {
     Chorus(Chorus),
     Distortion(Dist),
     Pan(Pan),
+    Filter(Filter),
+    Limiter(Limiter),
+    Expander(Expander),
+    Tremolo(Tremolo),
+    Crusher(Crusher),
 }
 
 impl Dsp {
@@ -37,6 +42,11 @@ impl Dsp {
             Kind::Delay => Dsp::Delay(Delay::new()),
             Kind::Chorus => Dsp::Chorus(Chorus::new()),
             Kind::Distortion => Dsp::Distortion(Dist::new()),
+            Kind::Filter => Dsp::Filter(Filter::new()),
+            Kind::Limiter => Dsp::Limiter(Limiter::new()),
+            Kind::Expander => Dsp::Expander(Expander::new()),
+            Kind::Tremolo => Dsp::Tremolo(Tremolo::new()),
+            Kind::Crusher => Dsp::Crusher(Crusher::new()),
             // Pan, plus a defensive fallback for non-DSP kinds (never constructed).
             _ => Dsp::Pan(Pan::new()),
         }
@@ -52,6 +62,11 @@ impl Dsp {
             Dsp::Chorus(p) => p.process(buf, sr),
             Dsp::Distortion(p) => p.process(buf),
             Dsp::Pan(p) => p.process(buf),
+            Dsp::Filter(p) => p.process(buf, sr),
+            Dsp::Limiter(p) => p.process(buf, sr),
+            Dsp::Expander(p) => p.process(buf, sr),
+            Dsp::Tremolo(p) => p.process(buf, sr),
+            Dsp::Crusher(p) => p.process(buf),
         }
     }
 
@@ -65,6 +80,11 @@ impl Dsp {
             Dsp::Chorus(p) => p.set_param(param, value),
             Dsp::Distortion(p) => p.set_param(param, value),
             Dsp::Pan(p) => p.set_param(param, value),
+            Dsp::Filter(p) => p.set_param(param, value),
+            Dsp::Limiter(p) => p.set_param(param, value),
+            Dsp::Expander(p) => p.set_param(param, value),
+            Dsp::Tremolo(p) => p.set_param(param, value),
+            Dsp::Crusher(p) => p.set_param(param, value),
         }
     }
 }
@@ -739,6 +759,289 @@ impl Reverb {
                 self.dirty = true;
             }
             "predelay" => self.predelay = value,
+            _ => {}
+        }
+    }
+}
+
+// ── Filter (standalone biquad: low/high-pass, band-pass, notch) ───────────────
+
+/// RBJ cookbook coefficients for the standalone filter types (normalised by a0).
+/// `ftype`: 0 = low-pass, 1 = high-pass, 2 = band-pass (0 dB peak), 3 = notch.
+fn filter_coeffs(ftype: u8, freq: f32, q: f32, sr: f32) -> [f32; 5] {
+    let w0 = 2.0 * PI * (freq / sr).clamp(1e-5, 0.4999);
+    let cw = w0.cos();
+    let sw = w0.sin();
+    let alpha = sw / (2.0 * q.max(1e-4));
+    let a0 = 1.0 + alpha;
+    let (b0, b1, b2, a1, a2) = match ftype {
+        1 => ((1.0 + cw) / 2.0, -(1.0 + cw), (1.0 + cw) / 2.0, -2.0 * cw, 1.0 - alpha), // high-pass
+        2 => (alpha, 0.0, -alpha, -2.0 * cw, 1.0 - alpha),                              // band-pass
+        3 => (1.0, -2.0 * cw, 1.0, -2.0 * cw, 1.0 - alpha),                             // notch
+        _ => ((1.0 - cw) / 2.0, 1.0 - cw, (1.0 - cw) / 2.0, -2.0 * cw, 1.0 - alpha),    // low-pass
+    };
+    [b0 / a0, b1 / a0, b2 / a0, a1 / a0, a2 / a0]
+}
+
+pub struct Filter {
+    ftype: u8,
+    cutoff: f32,
+    q: f32,
+    l: Biquad,
+    r: Biquad,
+    sr: f32,
+    dirty: bool,
+}
+impl Filter {
+    fn new() -> Self {
+        Filter { ftype: 0, cutoff: 1000.0, q: 0.707, l: Biquad::identity(), r: Biquad::identity(), sr: 0.0, dirty: true }
+    }
+    fn process(&mut self, buf: &mut [f32], sr: f32) {
+        if self.dirty || (sr - self.sr).abs() > 0.5 {
+            let c = filter_coeffs(self.ftype, self.cutoff, self.q, sr);
+            self.l.set(c);
+            self.r.set(c);
+            self.sr = sr;
+            self.dirty = false;
+        }
+        let frames = buf.len() / 2;
+        for i in 0..frames {
+            buf[2 * i] = self.l.process(buf[2 * i]);
+            buf[2 * i + 1] = self.r.process(buf[2 * i + 1]);
+        }
+    }
+    fn set_param(&mut self, param: &str, value: f32) {
+        match param {
+            "type" => self.ftype = value as u8,
+            "cutoff" => self.cutoff = value,
+            "q" => self.q = value,
+            _ => {}
+        }
+        self.dirty = true;
+    }
+}
+
+// ── Limiter (brickwall peak limiter: instant attack, adjustable release) ──────
+
+pub struct Limiter {
+    ceiling: f32, // linear threshold (from dB)
+    release: f32,
+    gain: f32, // current applied gain (≤ 1)
+    rel_c: f32,
+    sr: f32,
+    dirty: bool,
+}
+impl Limiter {
+    fn new() -> Self {
+        Limiter { ceiling: 10f32.powf(-1.0 / 20.0), release: 0.10, gain: 1.0, rel_c: 1.0, sr: 0.0, dirty: true }
+    }
+    fn process(&mut self, buf: &mut [f32], sr: f32) {
+        if self.dirty || (sr - self.sr).abs() > 0.5 {
+            self.rel_c = 1.0 - (-1.0 / (self.release.max(1e-4) * sr)).exp();
+            self.sr = sr;
+            self.dirty = false;
+        }
+        let frames = buf.len() / 2;
+        for i in 0..frames {
+            let l = buf[2 * i];
+            let r = buf[2 * i + 1];
+            let peak = l.abs().max(r.abs());
+            // Gain needed to keep this peak under the ceiling.
+            let target = if peak > self.ceiling { self.ceiling / peak } else { 1.0 };
+            // Instant attack (catch the transient), smoothed release back up.
+            if target < self.gain {
+                self.gain = target;
+            } else {
+                self.gain += (target - self.gain) * self.rel_c;
+            }
+            buf[2 * i] = l * self.gain;
+            buf[2 * i + 1] = r * self.gain;
+        }
+    }
+    fn set_param(&mut self, param: &str, value: f32) {
+        match param {
+            "threshold" => self.ceiling = 10f32.powf(value / 20.0),
+            "release" => {
+                self.release = value;
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Expander (downward expander: attenuate below threshold) ───────────────────
+
+pub struct Expander {
+    threshold: f32,
+    ratio: f32,
+    attack: f32,
+    release: f32,
+    env_db: f32, // smoothed gain reduction (dB, ≤ 0)
+    att_c: f32,
+    rel_c: f32,
+    sr: f32,
+    dirty: bool,
+}
+impl Expander {
+    fn new() -> Self {
+        Expander { threshold: -40.0, ratio: 2.0, attack: 0.005, release: 0.10, env_db: 0.0, att_c: 1.0, rel_c: 1.0, sr: 0.0, dirty: true }
+    }
+    /// Below threshold, attenuate by `(ratio-1)·(x-threshold)` dB (≤ 0). Above, unity.
+    fn reduction_db(&self, xdb: f32) -> f32 {
+        if xdb < self.threshold {
+            (self.ratio.max(1.0) - 1.0) * (xdb - self.threshold)
+        } else {
+            0.0
+        }
+    }
+    fn process(&mut self, buf: &mut [f32], sr: f32) {
+        if self.dirty || (sr - self.sr).abs() > 0.5 {
+            self.att_c = 1.0 - (-1.0 / (self.attack.max(1e-4) * sr)).exp();
+            self.rel_c = 1.0 - (-1.0 / (self.release.max(1e-4) * sr)).exp();
+            self.sr = sr;
+            self.dirty = false;
+        }
+        let frames = buf.len() / 2;
+        for i in 0..frames {
+            let l = buf[2 * i];
+            let r = buf[2 * i + 1];
+            let level = l.abs().max(r.abs());
+            let xdb = 20.0 * (level + 1e-9).log10();
+            let target = self.reduction_db(xdb);
+            // More gain reduction = "attack" (gate closing faster than it opens).
+            let c = if target < self.env_db { self.att_c } else { self.rel_c };
+            self.env_db += (target - self.env_db) * c;
+            let g = 10f32.powf(self.env_db / 20.0);
+            buf[2 * i] = l * g;
+            buf[2 * i + 1] = r * g;
+        }
+    }
+    fn set_param(&mut self, param: &str, value: f32) {
+        match param {
+            "threshold" => self.threshold = value,
+            "ratio" => self.ratio = value,
+            "attack" => {
+                self.attack = value;
+                self.dirty = true;
+            }
+            "release" => {
+                self.release = value;
+                self.dirty = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+// ── Tremolo / Auto-pan (LFO-modulated amplitude or stereo position) ───────────
+
+pub struct Tremolo {
+    mode: u8,  // 0 = tremolo (amplitude), 1 = auto-pan (position)
+    shape: u8, // 0 = sine, 1 = triangle
+    rate: f32,
+    depth: f32,
+    phase: f32,
+}
+impl Tremolo {
+    fn new() -> Self {
+        Tremolo { mode: 0, shape: 0, rate: 5.0, depth: 0.7, phase: 0.0 }
+    }
+    /// Unipolar LFO in [0,1] for the current phase.
+    #[inline]
+    fn lfo01(&self) -> f32 {
+        match self.shape {
+            1 => {
+                // Triangle.
+                let t = self.phase / (2.0 * PI);
+                if t < 0.5 { t * 2.0 } else { 2.0 - t * 2.0 }
+            }
+            _ => 0.5 + 0.5 * self.phase.sin(),
+        }
+    }
+    fn process(&mut self, buf: &mut [f32], sr: f32) {
+        let inc = 2.0 * PI * self.rate / sr.max(1.0);
+        let depth = self.depth.clamp(0.0, 1.0);
+        let frames = buf.len() / 2;
+        for i in 0..frames {
+            let l = buf[2 * i];
+            let r = buf[2 * i + 1];
+            let u = self.lfo01();
+            if self.mode == 1 {
+                // Auto-pan: equal-power, pan ∈ [-depth, depth].
+                let p = (u * 2.0 - 1.0) * depth;
+                let x = if p <= 0.0 { p + 1.0 } else { p };
+                let gl = (x * PI / 2.0).cos();
+                let gr = (x * PI / 2.0).sin();
+                if p <= 0.0 {
+                    buf[2 * i] = l + r * gl;
+                    buf[2 * i + 1] = r * gr;
+                } else {
+                    buf[2 * i] = l * gl;
+                    buf[2 * i + 1] = r + l * gr;
+                }
+            } else {
+                // Tremolo: amplitude dips toward (1-depth) at the LFO trough.
+                let g = 1.0 - depth * (1.0 - u);
+                buf[2 * i] = l * g;
+                buf[2 * i + 1] = r * g;
+            }
+            self.phase += inc;
+            if self.phase > 2.0 * PI {
+                self.phase -= 2.0 * PI;
+            }
+        }
+    }
+    fn set_param(&mut self, param: &str, value: f32) {
+        match param {
+            "mode" => self.mode = value as u8,
+            "shape" => self.shape = value as u8,
+            "rate" => self.rate = value,
+            "depth" => self.depth = value,
+            _ => {}
+        }
+    }
+}
+
+// ── Bitcrusher (bit-depth quantize + sample-rate decimation, dry/wet) ─────────
+
+pub struct Crusher {
+    bits: f32,
+    downsample: f32, // hold each sample for this many input samples (≥ 1)
+    mix: f32,
+    hold_l: f32,
+    hold_r: f32,
+    counter: f32,
+}
+impl Crusher {
+    fn new() -> Self {
+        Crusher { bits: 8.0, downsample: 1.0, mix: 1.0, hold_l: 0.0, hold_r: 0.0, counter: 0.0 }
+    }
+    fn process(&mut self, buf: &mut [f32]) {
+        let levels = 2f32.powf(self.bits.clamp(1.0, 16.0));
+        let half = (levels / 2.0).max(1.0);
+        let step = self.downsample.max(1.0);
+        let dry = 1.0 - self.mix;
+        let frames = buf.len() / 2;
+        for i in 0..frames {
+            let l = buf[2 * i];
+            let r = buf[2 * i + 1];
+            self.counter += 1.0;
+            if self.counter >= step {
+                self.counter -= step;
+                // Quantize to `bits` resolution.
+                self.hold_l = (l * half).round() / half;
+                self.hold_r = (r * half).round() / half;
+            }
+            buf[2 * i] = l * dry + self.hold_l * self.mix;
+            buf[2 * i + 1] = r * dry + self.hold_r * self.mix;
+        }
+    }
+    fn set_param(&mut self, param: &str, value: f32) {
+        match param {
+            "bits" => self.bits = value,
+            "downsample" => self.downsample = value,
+            "mix" => self.mix = value,
             _ => {}
         }
     }

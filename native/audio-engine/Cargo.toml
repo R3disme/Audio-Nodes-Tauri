@@ -7,7 +7,10 @@ license = "MIT"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# `rlib` alongside `cdylib` so `cargo test` can build the unit tests (e.g. the
+# cycle-detection tests); the `.node` addon is still produced from the `cdylib`
+# target by napi-build.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 napi = { version = "2", default-features = false, features = ["napi6"] }
@@ -19,6 +22,16 @@ cpal = "0.15"
 # snapshot pointer (control thread swaps, audio thread loads).
 ringbuf = "0.4"
 arc-swap = "1"
+
+# Direct WASAPI access for the optional IAudioClient3 low-latency output backend.
+# Pinned to the same major as cpal's transitive `windows` to reuse the built crates.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.54", features = [
+  "Win32_Foundation",
+  "Win32_Media_Audio",
+  "Win32_System_Com",
+  "Win32_System_Threading",
+] }
 
 [build-dependencies]
 napi-build = "2"

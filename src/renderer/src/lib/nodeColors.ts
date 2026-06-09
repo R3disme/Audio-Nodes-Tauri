@@ -20,11 +20,16 @@ export const DEFAULT_NODE_COLORS: Record<string, string> = {
   compressor:  '#117864',
   gate:        '#6e2020',
   pan:         '#4f6d7a',
+  filter:      '#3b6ea5',
+  limiter:     '#1a7a6b',
+  expander:    '#5a5230',
   // Creative effects
   reverb:      '#1b6f8c',
   delay:       '#2f5fa0',
   chorus:      '#8e3b8e',
   distortion:  '#a35a1e',
+  tremolo:     '#7d5a2f',
+  bitcrusher:  '#8a5a2a',
   // Mixing / sinks
   mixer:       '#76448a',
   output:      '#1d6a3a',
@@ -34,8 +39,9 @@ export const DEFAULT_NODE_COLORS: Record<string, string> = {
 
 /** Stable ordering used by the theme editor and simple-theme hue generation. */
 export const NODE_TYPE_ORDER = [
-  'input', 'fileplayer', 'application', 'volume', 'eq', 'compressor', 'gate', 'pan',
-  'reverb', 'delay', 'chorus', 'distortion', 'mixer', 'output', 'virtual', 'recorder'
+  'input', 'fileplayer', 'application', 'volume', 'eq', 'compressor', 'gate', 'expander', 'pan',
+  'filter', 'reverb', 'delay', 'chorus', 'distortion', 'tremolo', 'bitcrusher', 'limiter',
+  'mixer', 'output', 'virtual', 'recorder'
 ] as const
 
 const FALLBACK = '#52525b'

@@ -176,6 +176,14 @@ impl NativeAudioEngine {
         self.engine.set_latency_mode(&mode);
     }
 
+    /// Set the output device backend (`"shared"` = cpal; `"lowlatency"` = WASAPI
+    /// IAudioClient3 shared low-latency, cpal fallback). Takes effect on the next
+    /// output (re)open, so the renderer reloads after changing it.
+    #[napi]
+    pub fn set_device_mode(&self, mode: String) {
+        self.engine.set_device_mode(&mode);
+    }
+
     /// Current meter levels: `"<nodeId>:<index>" -> dB`. Polled by the renderer.
     #[napi]
     pub fn meters(&self) -> HashMap<String, f64> {

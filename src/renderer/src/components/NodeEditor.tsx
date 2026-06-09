@@ -27,7 +27,13 @@ import { DelayNode } from './nodes/DelayNode'
 import { ChorusNode } from './nodes/ChorusNode'
 import { DistortionNode } from './nodes/DistortionNode'
 import { PanNode } from './nodes/PanNode'
+import { FilterNode } from './nodes/FilterNode'
+import { LimiterNode } from './nodes/LimiterNode'
+import { ExpanderNode } from './nodes/ExpanderNode'
+import { TremoloNode } from './nodes/TremoloNode'
+import { BitcrusherNode } from './nodes/BitcrusherNode'
 import { RecorderNode } from './nodes/RecorderNode'
+import { GroupNode } from './nodes/GroupNode'
 import { DEFAULT_NODE_COLORS } from '@renderer/lib/nodeColors'
 import { useSettingsStore } from '@renderer/store/settingsStore'
 import { memo, useEffect, useCallback } from 'react'
@@ -47,8 +53,14 @@ const nodeTypes: NodeTypes = {
   chorus:      memo(ChorusNode),
   distortion:  memo(DistortionNode),
   pan:         memo(PanNode),
+  filter:      memo(FilterNode),
+  limiter:     memo(LimiterNode),
+  expander:    memo(ExpanderNode),
+  tremolo:     memo(TremoloNode),
+  bitcrusher:  memo(BitcrusherNode),
   mixer:       memo(MixerNode),
-  recorder:    memo(RecorderNode)
+  recorder:    memo(RecorderNode),
+  subgraph:    memo(GroupNode)
 }
 
 const defaultEdgeOptions = {
@@ -73,6 +85,26 @@ function NodeEditorInner(): JSX.Element {
     initAudio().catch(console.error)
   }, [initAudio])
 
+  // Ctrl/Cmd+G groups the selection; Ctrl/Cmd+Shift+G ungroups selected group(s).
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'g') return
+      const tag = (e.target as HTMLElement)?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return // don't hijack text fields
+      e.preventDefault()
+      const store = useAudioStore.getState()
+      if (e.shiftKey) {
+        for (const n of store.nodes) {
+          if (n.type === 'subgraph' && n.selected) store.ungroup(n.id)
+        }
+      } else {
+        store.groupSelection()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [])
+
   const onDrop = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
       e.preventDefault()
@@ -90,6 +122,11 @@ function NodeEditorInner(): JSX.Element {
   }, [])
 
   const showBgImage = theme.backgroundImageEnabled && !!theme.backgroundImage
+
+  // Grouping affordances: show a Group button when ≥2 ungrouped nodes are selected,
+  // and an Ungroup button when a group container is selected.
+  const groupableCount = nodes.filter(n => n.selected && n.type !== 'subgraph' && !n.parentId).length
+  const selectedGroup = nodes.find(n => n.selected && n.type === 'subgraph')
 
   return (
     <div
@@ -167,6 +204,23 @@ function NodeEditorInner(): JSX.Element {
               <span className="w-2 h-2 rounded-full animate-ping" style={{ background: 'var(--c-accent)' }} />
               Initializing audio engine…
             </div>
+          </Panel>
+        )}
+
+        {(groupableCount >= 2 || selectedGroup) && (
+          <Panel position="top-center">
+            <button
+              onClick={() => {
+                const store = useAudioStore.getState()
+                if (groupableCount >= 2) store.groupSelection()
+                else if (selectedGroup) store.ungroup(selectedGroup.id)
+              }}
+              className="rounded-lg px-3 py-1.5 text-xs font-semibold shadow-xl backdrop-blur transition-colors"
+              style={{ background: 'var(--c-accent)', color: '#1a1a1a', border: '1px solid var(--c-border)' }}
+              title={groupableCount >= 2 ? 'Group selected nodes (Ctrl+G)' : 'Ungroup (Ctrl+Shift+G)'}
+            >
+              {groupableCount >= 2 ? `⊞ Group ${groupableCount} nodes` : '⊟ Ungroup'}
+            </button>
           </Panel>
         )}
 

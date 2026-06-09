@@ -24,7 +24,7 @@ export function InputNode({ id, data, selected }: NodeProps): JSX.Element {
   const setDevice = async (deviceId: string, deviceName: string): Promise<void> => {
     updateNodeData(id, { deviceId, deviceName })
     try {
-      await audioEngine.createInputNode(id, deviceId || undefined)
+      await audioEngine.createInputNode(id, deviceId || undefined, deviceName)
     } catch (e) {
       console.error('Failed to switch input device:', e)
     }

@@ -5,7 +5,6 @@ import { NodeBase, SliderRow, MuteButton } from './NodeBase'
 import { AudioHandle } from './AudioHandle'
 import { StereoVUMeter } from '../VUMeter'
 import { useAudioStore, type FilePlayerNodeData } from '@renderer/store/audioStore'
-import { useSettingsStore } from '@renderer/store/settingsStore'
 import { audioEngine } from '@renderer/audio/backend'
 
 function fmt(s: number): string {
@@ -22,7 +21,6 @@ function fmt(s: number): string {
 export function FilePlayerNode({ id, data, selected }: NodeProps): JSX.Element {
   const d = data as unknown as FilePlayerNodeData
   const updateNodeData = useAudioStore(s => s.updateNodeData)
-  const native = useSettingsStore(s => s.engine === 'native')
 
   const [status, setStatus] = useState({ playing: false, currentTime: 0, duration: 0 })
   const fileRef = useRef<HTMLInputElement>(null)
@@ -78,26 +76,20 @@ export function FilePlayerNode({ id, data, selected }: NodeProps): JSX.Element {
       {/* File picker */}
       <button
         onClick={() => fileRef.current?.click()}
-        disabled={native}
-        className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-[10px] nodrag transition-colors mb-2 disabled:opacity-40 disabled:cursor-not-allowed"
+        className="w-full flex items-center gap-2 px-2 py-1.5 rounded text-[10px] nodrag transition-colors mb-2"
         style={{ background: 'var(--c-surface-3)', border: '1px solid var(--c-border)', color: 'var(--c-text)' }}
-        title={native ? 'File player requires the Web Audio engine' : d.fileName || 'Choose an audio file'}
+        title={d.fileName || 'Choose an audio file'}
       >
         <FolderOpen size={12} className="shrink-0" style={{ color: 'var(--node-fileplayer)' }} />
         <span className="truncate flex-1 text-left">{d.fileName || 'Load audio file…'}</span>
       </button>
       <input ref={fileRef} type="file" accept="audio/*" className="hidden" onChange={onPick} />
-      {native && (
-        <div className="text-[9px] mb-1.5" style={{ color: 'var(--c-text-dim)' }}>
-          Web Audio only — switch engine in Theme settings to use this.
-        </div>
-      )}
 
       {/* Transport */}
       <div className="flex items-center gap-1.5 mb-1.5">
         <button
           onClick={togglePlay}
-          disabled={!hasFile || native}
+          disabled={!hasFile}
           className="w-7 h-7 flex items-center justify-center rounded nodrag transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
           style={{ background: 'var(--node-fileplayer)', color: '#fff' }}
           title={status.playing ? 'Pause' : 'Play'}

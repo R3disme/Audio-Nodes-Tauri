@@ -1,4 +1,4 @@
-import { PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { PanelLeftClose, ChevronsRight } from 'lucide-react'
 import { useAudioStore } from '@renderer/store/audioStore'
 import { useSettingsStore } from '@renderer/store/settingsStore'
 import { nodeColor } from '@renderer/lib/nodeColors'
@@ -21,11 +21,16 @@ const NODE_PALETTE: NodeEntry[] = [
   { type: 'eq',          label: 'Equalizer',    icon: '🎚', description: '5-band parametric EQ',     category: 'effect' },
   { type: 'compressor',  label: 'Compressor',   icon: '📉', description: 'Dynamics control',         category: 'effect' },
   { type: 'gate',        label: 'Gate',         icon: '🚪', description: 'Silence below threshold',  category: 'effect' },
+  { type: 'expander',    label: 'Expander',     icon: '📈', description: 'Downward dynamics expand', category: 'effect' },
+  { type: 'limiter',     label: 'Limiter',      icon: '🧱', description: 'Brickwall peak ceiling',   category: 'effect' },
+  { type: 'filter',      label: 'Filter',       icon: '🔉', description: 'LP/HP/BP/notch filter',    category: 'effect' },
   { type: 'pan',         label: 'Pan',          icon: '↔', description: 'Stereo placement',         category: 'effect' },
   { type: 'reverb',      label: 'Reverb',       icon: '🏛', description: 'Vocal space & ambience',   category: 'creative' },
   { type: 'delay',       label: 'Delay / Echo', icon: '🔁', description: 'Echo with feedback',       category: 'creative' },
   { type: 'chorus',      label: 'Chorus',       icon: '🌀', description: 'Thicken & double vocals',  category: 'creative' },
+  { type: 'tremolo',     label: 'Tremolo',      icon: '〰', description: 'LFO amplitude / auto-pan', category: 'creative' },
   { type: 'distortion',  label: 'Distortion',   icon: '⚡', description: 'Saturation & drive',       category: 'creative' },
+  { type: 'bitcrusher',  label: 'Bitcrusher',   icon: '👾', description: 'Lo-fi bit / rate crush',   category: 'creative' },
   { type: 'mixer',       label: 'Mixer',        icon: '🎛', description: '4-channel sum',            category: 'mix' },
   { type: 'output',      label: 'Output',       icon: '🔊', description: 'Speakers / headphones',    category: 'sink' },
   { type: 'virtual',     label: 'Virtual Out',  icon: '🎧', description: 'Route to other apps',      category: 'sink' },
@@ -54,34 +59,16 @@ export function Sidebar(): JSX.Element {
 
   const grouped = ORDER.map(cat => ({ cat, items: NODE_PALETTE.filter(n => n.category === cat) }))
 
-  // ── Collapsed rail: just the colored icons ───────────────────────────────
+  // ── Minimized: a thin strip with only a restore affordance (single toggle) ──
   if (collapsed) {
     return (
       <aside
-        className="w-12 flex flex-col items-center py-2 gap-1 overflow-y-auto shrink-0"
+        onClick={toggle}
+        title="Show node panel"
+        className="w-3 hover:w-5 flex flex-col items-center pt-2 shrink-0 cursor-pointer transition-all group"
         style={{ background: 'var(--c-surface)', borderRight: '1px solid var(--c-border)' }}
       >
-        <button
-          onClick={toggle}
-          title="Expand panel"
-          className="w-8 h-8 flex items-center justify-center rounded hover:bg-white/10 transition-colors mb-1"
-          style={{ color: 'var(--c-text-dim)' }}
-        >
-          <PanelLeftOpen size={15} />
-        </button>
-        {NODE_PALETTE.map(entry => (
-          <button
-            key={entry.type}
-            draggable
-            onDragStart={e => onDragStart(e, entry.type)}
-            onClick={() => addNode(entry.type)}
-            title={`${entry.label} — ${entry.description}`}
-            className="w-8 h-8 rounded flex items-center justify-center text-sm shrink-0 ring-1 ring-black/30 hover:ring-white/20 hover:scale-105 transition-all"
-            style={{ background: nodeColor(entry.type) }}
-          >
-            {entry.icon}
-          </button>
-        ))}
+        <ChevronsRight size={13} style={{ color: 'var(--c-text-dim)' }} className="group-hover:text-white/80 transition-colors" />
       </aside>
     )
   }
@@ -103,7 +90,7 @@ export function Sidebar(): JSX.Element {
         </div>
         <button
           onClick={toggle}
-          title="Collapse panel"
+          title="Hide panel"
           className="p-1 rounded hover:bg-white/10 transition-colors"
           style={{ color: 'var(--c-text-dim)' }}
         >

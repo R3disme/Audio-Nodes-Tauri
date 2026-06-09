@@ -64,6 +64,7 @@ interface NativeAudioEngineInstance {
   setMuted(id: string, muted: boolean): void
   setParam(id: string, param: string, index: number, value: number): void
   setLatencyMode(mode: string): void
+  setDeviceMode(mode: string): void
   destroyNode(id: string): void
   meters(): Record<string, number>
   latencyMs(): number
@@ -270,6 +271,8 @@ app.whenReady().then(() => {
     withEngine((e) => e.setParam(id, param, index, value)))
   ipcMain.on('audio:set-latency-mode', (_e, mode: string) =>
     withEngine((e) => e.setLatencyMode(mode)))
+  ipcMain.on('audio:set-device-mode', (_e, mode: string) =>
+    withEngine((e) => e.setDeviceMode(mode)))
   ipcMain.on('audio:destroy-node', (_e, id: string) => withEngine((e) => e.destroyNode(id)))
 
   // Set up displayMedia handler. Allows the renderer to call getDisplayMedia

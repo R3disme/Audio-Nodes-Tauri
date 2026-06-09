@@ -19,7 +19,12 @@ import type {
   DelayParams,
   ChorusParams,
   DistortionParams,
-  PanParams
+  PanParams,
+  FilterParams,
+  LimiterParams,
+  ExpanderParams,
+  TremoloParams,
+  CrusherParams
 } from './AudioEngine'
 
 export interface AudioBackend {
@@ -28,6 +33,8 @@ export interface AudioBackend {
   getLatencyMs(): number
   /** Set the latency/cushion mode (native only; Web Audio no-ops). */
   setLatencyMode(mode: 'low' | 'balanced' | 'safe'): void
+  /** Set the output device backend (native only; Web Audio no-ops). */
+  setDeviceMode(mode: 'shared' | 'lowlatency' | 'exclusive'): void
 
   // ── Meter + state subscriptions (bypass React) ─────────────────────────────
   subscribeMeter(key: string, cb: (db: number) => void): () => void
@@ -35,7 +42,9 @@ export interface AudioBackend {
   getCompressorReduction(id: string, channel?: number): number
 
   // ── Input device ────────────────────────────────────────────────────────
-  createInputNode(id: string, deviceId?: string): Promise<void>
+  // `deviceName` is the persisted label, kept so a reconnect can fall back to it
+  // when the saved `deviceId` no longer resolves (ids churn across hot-plugs).
+  createInputNode(id: string, deviceId?: string, deviceName?: string): Promise<void>
   isInputActive(id: string): boolean
   recoverInputs(): Promise<void>
 
@@ -46,7 +55,7 @@ export interface AudioBackend {
 
   // ── Output device ─────────────────────────────────────────────────────────
   createOutputNode(id: string, type?: 'output' | 'virtual'): void
-  setOutputDevice(id: string, deviceId: string): Promise<void>
+  setOutputDevice(id: string, deviceId: string, deviceName?: string): Promise<void>
   recoverOutputs(): Promise<void>
 
   // ── Recorder (sink that captures to a file) ────────────────────────────────
@@ -75,6 +84,11 @@ export interface AudioBackend {
   createChorusNode(id: string, channels?: number, params?: ChorusParams): void
   createDistortionNode(id: string, channels?: number, params?: DistortionParams): void
   createPanNode(id: string, channels?: number, params?: PanParams): void
+  createFilterNode(id: string, channels?: number, params?: FilterParams): void
+  createLimiterNode(id: string, channels?: number, params?: LimiterParams): void
+  createExpanderNode(id: string, channels?: number, params?: ExpanderParams): void
+  createTremoloNode(id: string, channels?: number, params?: TremoloParams): void
+  createBitcrusherNode(id: string, channels?: number, params?: CrusherParams): void
 
   // ── Per-node parameter updates ──────────────────────────────────────────
   setGain(id: string, linearGain: number, channel?: number): void
@@ -92,6 +106,11 @@ export interface AudioBackend {
   setChorus(id: string, params: Partial<ChorusParams>): void
   setDistortion(id: string, params: Partial<DistortionParams>): void
   setPan(id: string, pan: number): void
+  setFilter(id: string, params: Partial<FilterParams>): void
+  setLimiter(id: string, params: Partial<LimiterParams>): void
+  setExpander(id: string, params: Partial<ExpanderParams>): void
+  setTremolo(id: string, params: Partial<TremoloParams>): void
+  setBitcrusher(id: string, params: Partial<CrusherParams>): void
 
   // ── Routing + channel reconfiguration ──────────────────────────────────────
   connect(sourceId: string, sourceChannel: number, targetId: string, targetChannel: number): boolean

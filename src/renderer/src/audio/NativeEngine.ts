@@ -14,6 +14,7 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 import type { AudioBackend } from './AudioBackend'
+import { resolveDeviceId } from '@renderer/lib/deviceMatch'
 import type {
   AudioNodeType,
   EQBand,
@@ -21,7 +22,12 @@ import type {
   DelayParams,
   ChorusParams,
   DistortionParams,
-  PanParams
+  PanParams,
+  FilterParams,
+  LimiterParams,
+  ExpanderParams,
+  TremoloParams,
+  CrusherParams
 } from './AudioEngine'
 
 interface Conn {
@@ -42,6 +48,11 @@ class NativeEngine implements AudioBackend {
   private mutes = new Map<string, boolean>()
   /** Per node: last value for each effect param, keyed `${param}#${index}`. */
   private params = new Map<string, Map<string, { param: string; index: number; value: number }>>()
+
+  /** Saved device selection per I/O node (id + persisted label) for name-fallback
+   *  reconnect on `devicechange` when the saved deviceId churns. */
+  private inputDevices = new Map<string, { id: string; name: string }>()
+  private outputDevices = new Map<string, { id: string; name: string }>()
 
   /** Latest per-channel compressor gain reduction, keyed `${id}#gr${ch}`. */
   private grCache = new Map<string, number>()
@@ -82,6 +93,10 @@ class NativeEngine implements AudioBackend {
 
   setLatencyMode(mode: 'low' | 'balanced' | 'safe'): void {
     window.api.audio.setLatencyMode(mode)
+  }
+
+  setDeviceMode(mode: 'shared' | 'lowlatency' | 'exclusive'): void {
+    window.api.audio.setDeviceMode(mode)
   }
 
   // ── Meters: poll the addon each frame, dispatch to DOM subscribers ─────────
@@ -126,7 +141,12 @@ class NativeEngine implements AudioBackend {
       this.meterSubs.set(key, set)
     }
     set.add(cb)
-    return () => set!.delete(cb)
+    // Drop the key when the last subscriber leaves so a long session of
+    // create/destroy doesn't accumulate empty Sets keyed by stale node ids.
+    return () => {
+      set!.delete(cb)
+      if (set!.size === 0) this.meterSubs.delete(key)
+    }
   }
 
   private nodeSubs = new Set<() => void>()
@@ -169,7 +189,8 @@ class NativeEngine implements AudioBackend {
 
   // ── Input / application ───────────────────────────────────────────────────
 
-  async createInputNode(id: string, deviceId?: string): Promise<void> {
+  async createInputNode(id: string, deviceId?: string, deviceName?: string): Promise<void> {
+    this.inputDevices.set(id, { id: deviceId ?? '', name: deviceName ?? '' })
     window.api.audio.createNode(id, 'input', 1, deviceId ?? '')
   }
 
@@ -177,7 +198,21 @@ class NativeEngine implements AudioBackend {
     return true
   }
 
-  async recoverInputs(): Promise<void> {}
+  /** On devicechange, reconnect any input whose saved id churned but whose label
+   *  still matches a present device — re-open the stream on the resolved id. */
+  async recoverInputs(): Promise<void> {
+    if (this.inputDevices.size === 0) return
+    const devices = await navigator.mediaDevices.enumerateDevices().catch(() => [] as MediaDeviceInfo[])
+    for (const [id, saved] of this.inputDevices) {
+      if (!saved.id) continue // default device — engine opens '' itself
+      const resolved = resolveDeviceId(devices, saved.id, saved.name, 'audioinput')
+      if (resolved !== undefined && resolved !== saved.id) {
+        saved.id = resolved
+        window.api.audio.createNode(id, 'input', 1, resolved)
+        this.replayState(id)
+      }
+    }
+  }
 
   // The renderer captures system audio with getDisplayMedia (proven, same as the
   // Web Audio engine) and bridges the PCM into the native engine's loopback ring.
@@ -206,12 +241,16 @@ class NativeEngine implements AudioBackend {
       const proc = ctx.createScriptProcessor(2048, 2, 1)
       const gain = ctx.createGain()
       gain.gain.value = 0
+      // Reused across callbacks (ScriptProcessor block size is fixed); Electron copies
+      // the IPC arg synchronously on send, so mutating it afterwards is safe — avoids
+      // ~4 KB of GC garbage every block.
+      let inter = new Float32Array(2048 * 2)
       proc.onaudioprocess = (e): void => {
         const inp = e.inputBuffer
         const L = inp.getChannelData(0)
         const R = inp.numberOfChannels > 1 ? inp.getChannelData(1) : L
         const n = inp.length
-        const inter = new Float32Array(n * 2)
+        if (inter.length !== n * 2) inter = new Float32Array(n * 2)
         for (let i = 0; i < n; i++) { inter[2 * i] = L[i]; inter[2 * i + 1] = R[i] }
         window.api.audio.pushCapture(id, inter)
       }
@@ -244,11 +283,26 @@ class NativeEngine implements AudioBackend {
     window.api.audio.createNode(id, type, 1, '')
   }
 
-  async setOutputDevice(id: string, deviceId: string): Promise<void> {
+  async setOutputDevice(id: string, deviceId: string, deviceName?: string): Promise<void> {
+    const prev = this.outputDevices.get(id)
+    this.outputDevices.set(id, { id: deviceId, name: deviceName ?? prev?.name ?? '' })
     window.api.audio.setOutputDevice(id, deviceId)
   }
 
-  async recoverOutputs(): Promise<void> {}
+  /** On devicechange, re-point any output whose saved id churned but whose label
+   *  still matches a present device. */
+  async recoverOutputs(): Promise<void> {
+    if (this.outputDevices.size === 0) return
+    const devices = await navigator.mediaDevices.enumerateDevices().catch(() => [] as MediaDeviceInfo[])
+    for (const [id, saved] of this.outputDevices) {
+      if (!saved.id) continue
+      const resolved = resolveDeviceId(devices, saved.id, saved.name, 'audiooutput')
+      if (resolved !== undefined && resolved !== saved.id) {
+        saved.id = resolved
+        window.api.audio.setOutputDevice(id, resolved)
+      }
+    }
+  }
 
   // ── Recorder ──────────────────────────────────────────────────────────────
   // The engine taps the node's signal and writes a 16-bit WAV; on stop the main
@@ -280,28 +334,92 @@ class NativeEngine implements AudioBackend {
   }
 
   // ── File player ───────────────────────────────────────────────────────────
-  // Decoding a file lives in the renderer (HTMLAudioElement); the native engine
-  // has no element to tap yet, so the node is a passthrough and transport is a
-  // no-op. (Native file playback = a future Rust decode path.)
-  private warnedNoFile = false
-  private warnFile(): void {
-    if (!this.warnedNoFile) {
-      console.warn('[native engine] file player is not yet supported — switch to the Web Audio engine.')
-      this.warnedNoFile = true
-    }
-  }
+  // Decoding + transport live in the renderer (an <audio> element, like Web Audio);
+  // the element is routed through a ScriptProcessor whose PCM is bridged into the
+  // engine's fed ring (Kind::Loopback) over IPC — the same proven path as application
+  // capture. The element plays only into the graph (not the speakers): its output goes
+  // to a 0-gain node that keeps the ScriptProcessor pumping (and the ring primed with
+  // silence while paused), exactly mirroring armApplicationCapture.
+  private filePlayers = new Map<string, {
+    ctx: AudioContext; el: HTMLAudioElement; src: MediaElementAudioSourceNode; proc: ScriptProcessorNode; gain: GainNode
+  }>()
 
   createFilePlayerNode(id: string): void {
     window.api.audio.createNode(id, 'fileplayer', 1, '')
+    if (this.filePlayers.has(id)) return
+    try {
+      const ctx = new AudioContext()
+      const el = new Audio()
+      el.preload = 'auto'
+      const src = ctx.createMediaElementSource(el)
+      const proc = ctx.createScriptProcessor(2048, 2, 1)
+      const gain = ctx.createGain()
+      gain.gain.value = 0
+      // Reused across callbacks (ScriptProcessor block size is fixed); Electron copies
+      // the IPC arg synchronously on send, so mutating it afterwards is safe — avoids
+      // ~4 KB of GC garbage every block.
+      let inter = new Float32Array(2048 * 2)
+      proc.onaudioprocess = (e): void => {
+        const inp = e.inputBuffer
+        const L = inp.getChannelData(0)
+        const R = inp.numberOfChannels > 1 ? inp.getChannelData(1) : L
+        const n = inp.length
+        if (inter.length !== n * 2) inter = new Float32Array(n * 2)
+        for (let i = 0; i < n; i++) { inter[2 * i] = L[i]; inter[2 * i + 1] = R[i] }
+        window.api.audio.pushCapture(id, inter)
+      }
+      src.connect(proc); proc.connect(gain); gain.connect(ctx.destination)
+      this.filePlayers.set(id, { ctx, el, src, proc, gain })
+    } catch (e) {
+      console.warn('[native engine] file player setup failed:', e)
+    }
   }
 
-  loadFilePlayer(_id: string, _url: string): void { this.warnFile() }
-  playFilePlayer(_id: string): void { this.warnFile() }
-  pauseFilePlayer(_id: string): void {}
-  setFilePlayerLoop(_id: string, _loop: boolean): void {}
-  seekFilePlayer(_id: string, _seconds: number): void {}
-  getFilePlayerStatus(_id: string): { playing: boolean; currentTime: number; duration: number } {
-    return { playing: false, currentTime: 0, duration: 0 }
+  private teardownFilePlayer(id: string): void {
+    const fp = this.filePlayers.get(id)
+    if (!fp) return
+    try { fp.proc.onaudioprocess = null; fp.proc.disconnect(); fp.src.disconnect(); fp.gain.disconnect() } catch { /* */ }
+    try { fp.el.pause(); fp.el.removeAttribute('src'); fp.el.load() } catch { /* */ }
+    void fp.ctx.close().catch(() => {})
+    this.filePlayers.delete(id)
+  }
+
+  loadFilePlayer(id: string, url: string): void {
+    const fp = this.filePlayers.get(id)
+    if (!fp) return
+    fp.el.src = url
+    fp.el.load()
+    void fp.ctx.resume()
+  }
+
+  playFilePlayer(id: string): void {
+    const fp = this.filePlayers.get(id)
+    if (!fp?.el.src) return
+    void fp.ctx.resume()
+    void fp.el.play().catch(e => console.warn('File player play() failed:', e))
+  }
+
+  pauseFilePlayer(id: string): void {
+    this.filePlayers.get(id)?.el.pause()
+  }
+
+  setFilePlayerLoop(id: string, loop: boolean): void {
+    const fp = this.filePlayers.get(id)
+    if (fp) fp.el.loop = loop
+  }
+
+  seekFilePlayer(id: string, seconds: number): void {
+    const el = this.filePlayers.get(id)?.el
+    if (el && isFinite(seconds)) el.currentTime = Math.max(0, seconds)
+  }
+
+  getFilePlayerStatus(id: string): { playing: boolean; currentTime: number; duration: number } {
+    const el = this.filePlayers.get(id)?.el
+    return {
+      playing: !!el && !el.paused && !el.ended,
+      currentTime: el?.currentTime ?? 0,
+      duration: el && isFinite(el.duration) ? el.duration : 0
+    }
   }
 
   // ── Node creation ─────────────────────────────────────────────────────────
@@ -371,6 +489,52 @@ class NativeEngine implements AudioBackend {
     if (params) this.setParam(id, 'pan', 0, params.pan)
   }
 
+  createFilterNode(id: string, channels = 1, params?: FilterParams): void {
+    window.api.audio.createNode(id, 'filter', channels, '')
+    if (params) {
+      this.setParam(id, 'type', 0, params.type)
+      this.setParam(id, 'cutoff', 0, params.cutoff)
+      this.setParam(id, 'q', 0, params.q)
+    }
+  }
+
+  createLimiterNode(id: string, channels = 1, params?: LimiterParams): void {
+    window.api.audio.createNode(id, 'limiter', channels, '')
+    if (params) {
+      this.setParam(id, 'threshold', 0, params.threshold)
+      this.setParam(id, 'release', 0, params.release)
+    }
+  }
+
+  createExpanderNode(id: string, channels = 1, params?: ExpanderParams): void {
+    window.api.audio.createNode(id, 'expander', channels, '')
+    if (params) {
+      this.setParam(id, 'threshold', 0, params.threshold)
+      this.setParam(id, 'ratio', 0, params.ratio)
+      this.setParam(id, 'attack', 0, params.attack)
+      this.setParam(id, 'release', 0, params.release)
+    }
+  }
+
+  createTremoloNode(id: string, channels = 1, params?: TremoloParams): void {
+    window.api.audio.createNode(id, 'tremolo', channels, '')
+    if (params) {
+      this.setParam(id, 'mode', 0, params.mode)
+      this.setParam(id, 'shape', 0, params.shape)
+      this.setParam(id, 'rate', 0, params.rate)
+      this.setParam(id, 'depth', 0, params.depth)
+    }
+  }
+
+  createBitcrusherNode(id: string, channels = 1, params?: CrusherParams): void {
+    window.api.audio.createNode(id, 'bitcrusher', channels, '')
+    if (params) {
+      this.setParam(id, 'bits', 0, params.bits)
+      this.setParam(id, 'downsample', 0, params.downsample)
+      this.setParam(id, 'mix', 0, params.mix)
+    }
+  }
+
   // ── Parameter updates ──────────────────────────────────────────────────
 
   setGain(id: string, linearGain: number, _channel?: number): void {
@@ -435,6 +599,37 @@ class NativeEngine implements AudioBackend {
 
   setPan(id: string, pan: number): void {
     this.setParam(id, 'pan', 0, pan)
+  }
+
+  setFilter(id: string, params: Partial<FilterParams>): void {
+    if (params.type !== undefined) this.setParam(id, 'type', 0, params.type)
+    if (params.cutoff !== undefined) this.setParam(id, 'cutoff', 0, params.cutoff)
+    if (params.q !== undefined) this.setParam(id, 'q', 0, params.q)
+  }
+
+  setLimiter(id: string, params: Partial<LimiterParams>): void {
+    if (params.threshold !== undefined) this.setParam(id, 'threshold', 0, params.threshold)
+    if (params.release !== undefined) this.setParam(id, 'release', 0, params.release)
+  }
+
+  setExpander(id: string, params: Partial<ExpanderParams>): void {
+    if (params.threshold !== undefined) this.setParam(id, 'threshold', 0, params.threshold)
+    if (params.ratio !== undefined) this.setParam(id, 'ratio', 0, params.ratio)
+    if (params.attack !== undefined) this.setParam(id, 'attack', 0, params.attack)
+    if (params.release !== undefined) this.setParam(id, 'release', 0, params.release)
+  }
+
+  setTremolo(id: string, params: Partial<TremoloParams>): void {
+    if (params.mode !== undefined) this.setParam(id, 'mode', 0, params.mode)
+    if (params.shape !== undefined) this.setParam(id, 'shape', 0, params.shape)
+    if (params.rate !== undefined) this.setParam(id, 'rate', 0, params.rate)
+    if (params.depth !== undefined) this.setParam(id, 'depth', 0, params.depth)
+  }
+
+  setBitcrusher(id: string, params: Partial<CrusherParams>): void {
+    if (params.bits !== undefined) this.setParam(id, 'bits', 0, params.bits)
+    if (params.downsample !== undefined) this.setParam(id, 'downsample', 0, params.downsample)
+    if (params.mix !== undefined) this.setParam(id, 'mix', 0, params.mix)
   }
 
   // ── Routing + channel reconfiguration ──────────────────────────────────────
@@ -515,12 +710,17 @@ class NativeEngine implements AudioBackend {
 
   destroyNode(id: string): void {
     this.stopAppCapture(id)
+    this.teardownFilePlayer(id)
     this.recording.delete(id)
     this.connections = this.connections.filter((c) => c.source !== id && c.target !== id)
     this.gains.delete(id)
     this.mutes.delete(id)
     this.params.delete(id)
+    this.inputDevices.delete(id)
+    this.outputDevices.delete(id)
     for (const key of this.grCache.keys()) if (key.startsWith(`${id}#gr`)) this.grCache.delete(key)
+    // Drop this node's meter-subscription buckets (mirrors AudioEngine.destroyNode).
+    for (const key of this.meterSubs.keys()) if (key.startsWith(`${id}:`)) this.meterSubs.delete(key)
     window.api.audio.destroyNode(id)
   }
 
