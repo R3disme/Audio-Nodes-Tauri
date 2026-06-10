@@ -26,6 +26,12 @@ const api = {
   windowMaximize: () => ipcRenderer.send('window-maximize'),
   windowClose: () => ipcRenderer.send('window-close'),
 
+  // Tells main which engine is live and whether any renderer-side PCM bridge
+  // (file player / app capture / recording) is active — main uses this to decide
+  // if the hidden window can be destroyed in the tray (RAM saving) or only hidden.
+  reportBackgroundState: (state: { engine: string; busy: boolean }): void =>
+    ipcRenderer.send('renderer:bg-state', state),
+
   listWindowSources: (): Promise<WindowSource[]> =>
     ipcRenderer.invoke('list-window-sources'),
   findSourceByName: (name: string): Promise<{ id: string; name: string } | null> =>
@@ -61,8 +67,8 @@ const api = {
     startRecording: (id: string): void => ipcRenderer.send('audio:start-recording', id),
     stopRecording: (id: string): Promise<{ bytes: Uint8Array; ext: string; mime: string } | null> =>
       ipcRenderer.invoke('audio:stop-recording', id),
-    pushCapture: (id: string, samples: Float32Array): void =>
-      ipcRenderer.send('audio:push-capture', id, samples)
+    pushCapture: (id: string, samples: Float32Array, sampleRate: number): void =>
+      ipcRenderer.send('audio:push-capture', id, samples, sampleRate)
   }
 }
 

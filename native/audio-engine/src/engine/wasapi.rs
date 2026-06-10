@@ -19,7 +19,7 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
-use windows::core::{GUID, PCWSTR};
+use windows::core::{w, GUID, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, FALSE, WAIT_OBJECT_0};
 use windows::Win32::Media::Audio::{
     eCapture, eConsole, eRender, IAudioCaptureClient, IAudioClient3, IAudioRenderClient, IMMDevice,
@@ -31,7 +31,10 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CoTaskMemFree, CoUninitialize, CLSCTX_ALL,
     COINIT_MULTITHREADED,
 };
-use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, CreateEventW,
+    WaitForSingleObject,
+};
 
 use ringbuf::traits::{Producer, Split};
 use ringbuf::{HeapProd, HeapRb};
@@ -43,6 +46,33 @@ use super::{render_output, EvalState, Shared, MAX_BLOCK_FRAMES, RING_FRAMES};
 // 32-bit IEEE float; anything else bails to cpal so we never blast misread samples.
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
+
+/// RAII MMCSS "Pro Audio" registration for the dedicated render/capture threads —
+/// the scheduling boost pro-audio apps use so the event-driven loops keep their
+/// deadlines under CPU load. Best-effort: on failure (e.g. MMCSS disabled) it logs
+/// and the thread runs unboosted. Reverts on drop.
+struct MmcssGuard(Option<HANDLE>);
+
+impl MmcssGuard {
+    fn register() -> MmcssGuard {
+        let mut task_index = 0u32;
+        match unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) } {
+            Ok(h) => MmcssGuard(Some(h)),
+            Err(e) => {
+                eprintln!("[audio] MMCSS 'Pro Audio' registration failed: {e}");
+                MmcssGuard(None)
+            }
+        }
+    }
+}
+
+impl Drop for MmcssGuard {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            let _ = unsafe { AvRevertMmThreadCharacteristics(h) };
+        }
+    }
+}
 const SUBTYPE_IEEE_FLOAT: GUID = GUID::from_u128(0x0000_0003_0000_0010_8000_00aa_0038_9b71);
 const SUBTYPE_PCM: GUID = GUID::from_u128(0x0000_0001_0000_0010_8000_00aa_0038_9b71);
 
@@ -245,6 +275,7 @@ unsafe fn render_thread(
         }
     };
 
+    let _mmcss = MmcssGuard::register();
     let mut st = EvalState::new();
 
     while !stop.load(Ordering::Relaxed) {
@@ -381,8 +412,8 @@ unsafe fn init_render(exclusive: bool) -> Result<RenderCtx, String> {
 // Mirrors WasapiOutput for the default *capture* endpoint, pushing PCM into the input
 // node's ring (the same ring cpal's `input_cb` feeds), so the engine's cushion/eval are
 // unchanged. The win: an exclusive capture stream runs at the device's *minimum* period
-// (~3 ms), so `shared.in_frames` (the cushion's device-block term) shrinks far below
-// cpal's ~10 ms shared period — the input half of the latency that "Low" mode couldn't
+// (~3 ms), so the node's `block_frames` (the cushion's per-ring fill-block term) shrinks
+// far below cpal's ~10 ms shared period — the input half of the latency "Low" mode couldn't
 // touch. Negotiates float then 16-bit PCM (converted to/from f32); falls back to cpal on
 // any failure.
 
@@ -472,6 +503,7 @@ unsafe fn capture_thread(
         }
     };
 
+    let _mmcss = MmcssGuard::register();
     // Cache the node Arc so the loop never locks the registry. dev_latency ≈ buffer depth.
     let node = shared.nodes.lock().unwrap().get(&node_id).cloned();
     if let Some(n) = &node {
@@ -503,7 +535,6 @@ unsafe fn capture_thread(
                 break;
             }
             let n = nframes as usize;
-            shared.in_frames.store(n.min(MAX_BLOCK_FRAMES) as u32, Ordering::Relaxed);
             let silent = (flags & 0x2) != 0; // AUDCLNT_BUFFERFLAGS_SILENT
             let master = shared.sr.load(Ordering::Relaxed) as f32;
 
@@ -559,6 +590,13 @@ unsafe fn capture_thread(
                 }
             }
             if !out.is_empty() {
+                // This ring's fill block (master-rate frames) — the cushion's per-node
+                // term. The exclusive path's small period is exactly what lets the
+                // input half of the cushion shrink.
+                if let Some(nd) = &node {
+                    nd.block_frames
+                        .store((out.len() / 2).min(MAX_BLOCK_FRAMES) as u32, Ordering::Relaxed);
+                }
                 let _ = prod.push_slice(&out);
             }
             let _ = ctx.capture.ReleaseBuffer(nframes);

@@ -4,30 +4,7 @@ import { useUpdateNodeInternals } from '@xyflow/react'
 import { useAudioStore } from '@renderer/store/audioStore'
 import { useSettingsStore } from '@renderer/store/settingsStore'
 import { DEFAULT_NODE_COLORS, darken } from '@renderer/lib/nodeColors'
-
-const headerIcons: Record<string, string> = {
-  input:       '🎙',
-  fileplayer:  '🎵',
-  application: '🪟',
-  output:      '🔊',
-  virtual:     '🎧',
-  volume:      '🔈',
-  eq:          '🎚',
-  compressor:  '📉',
-  gate:        '🚪',
-  reverb:      '🏛',
-  delay:       '🔁',
-  chorus:      '🌀',
-  distortion:  '⚡',
-  pan:         '↔',
-  filter:      '🔉',
-  limiter:     '🧱',
-  expander:    '📈',
-  tremolo:     '〰',
-  bitcrusher:  '👾',
-  mixer:       '🎛',
-  recorder:    '⏺'
-}
+import { NodeTypeIcon, nodeBadge } from '@renderer/lib/nodeIcons'
 
 interface NodeBaseProps {
   id: string
@@ -53,7 +30,7 @@ export function NodeBase({
   const colorOverride = useAudioStore(
     s => (s.nodes.find(n => n.id === id)?.data as { color?: string } | undefined)?.color
   )
-  const icon = headerIcons[nodeType] ?? '▪'
+  const badge = nodeBadge(nodeType)
 
   // React Flow caches each node's handle geometry. When the channel count (which
   // adds/moves sockets) or the global UI scale changes, the cache goes stale —
@@ -99,7 +76,8 @@ export function NodeBase({
         }}
       >
         <div className="flex items-center gap-1.5 text-white text-xs font-semibold tracking-wide min-w-0">
-          <span className="text-[12px] leading-none shrink-0 drop-shadow">{icon}</span>
+          <NodeTypeIcon type={nodeType} className="shrink-0 drop-shadow" />
+          {badge && <span className="text-[8px] font-bold tracking-wider opacity-80 shrink-0 drop-shadow-sm">{badge}</span>}
           <span className="truncate drop-shadow-sm">{label}</span>
         </div>
 

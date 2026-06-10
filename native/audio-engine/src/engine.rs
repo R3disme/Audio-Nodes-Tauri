@@ -25,8 +25,9 @@
 //   with its own gain) fold into a single output.
 //
 // Scope / limitations (documented, not bugs):
-//   • No resampling: input and output should run at the same sample rate (48 kHz
-//     is the usual Windows default). A mismatch drifts.
+//   • Resampling (capture rings + push_capture) is streaming *linear* interpolation at
+//     nominal rates — fine for voice/monitoring, not drift-adaptive (hardware-clock ppm
+//     drift can cause a rare correction blip).
 //   • Multiple outputs each pull the shared input ring buffer (contended); the
 //     common single-output case is correct.
 //   • Reverb is an algorithmic (Freeverb-style) approximation, not the convolution
@@ -64,15 +65,17 @@ const MAX_DEPTH: u32 = 64; // graph-recursion / cycle guard
 // instead of a hardcoded guess. The floor/ceiling come from the user's latency mode
 // (`min_margin_ms`/`max_margin_ms` on `Shared`, set by `set_latency_mode`).
 const STEP_UP_MS: f32 = 6.0; // margin growth per underrun
-const STEP_DOWN_MS: f32 = 1.0; // margin decay per stable interval
-const CLEAN_DECAY_SECS: f32 = 5.0; // clean-read stretch before one decay step
+const STEP_DOWN_MS: f32 = 2.0; // margin decay per stable interval
+const CLEAN_DECAY_SECS: f32 = 2.0; // clean-read stretch before one decay step
 const DRIFT_MARGIN_MS: f32 = 20.0; // how far past target the ring may drift before re-centering
 // Default latency-mode bounds (balanced) until `set_latency_mode` is called.
 const DEFAULT_MIN_MARGIN_MS: f32 = 8.0;
 const DEFAULT_MAX_MARGIN_MS: f32 = 60.0;
 
 /// Per-block cushion parameters, computed once in the output callback and threaded into
-/// `eval`. All margins in **ms**; `block` in mono frames (`max(in, out)` device block).
+/// `eval`. All margins in **ms**; `block` is the *output* device block in mono frames —
+/// `eval` maxes it with each input's own fill block (`NodeState::block_frames`), so every
+/// ring's cushion is sized to *its* producer's cadence instead of one global device term.
 #[derive(Clone, Copy)]
 struct CushionCfg {
     block: usize,
@@ -267,6 +270,26 @@ pub struct NodeState {
     /// Input/loopback only: consecutive clean (non-underrun) reads since the last decay,
     /// driving the slow margin decay back toward the floor.
     clean_blocks: AtomicU32,
+    /// Input/loopback only: this ring's *fill* block size in master-rate mono frames —
+    /// the device capture callback's block, or `push_capture`'s chunk size. The cushion's
+    /// worst-case phase-offset term, per node (a 2048-frame IPC push needs a much bigger
+    /// cushion than a 144-frame exclusive capture; one global term mis-sizes both).
+    block_frames: AtomicU32,
+    /// Loopback only: streaming linear-resampler state for `push_capture` (renderer
+    /// bridge rate → master), mirroring `input_cb`'s. Control thread only.
+    push_rs: Mutex<PushResample>,
+    /// I/O nodes: the requested device id (`""` ⇒ default), kept for the replay
+    /// no-op comparison in `create_node` / `set_*_device`.
+    device: Mutex<String>,
+}
+
+/// `push_capture`'s resampler continuity + reusable output scratch.
+#[derive(Default)]
+struct PushResample {
+    prev_l: f32,
+    prev_r: f32,
+    pos: f32,
+    out: Vec<f32>,
 }
 
 impl NodeState {
@@ -354,13 +377,20 @@ enum Command {
 
 // ── Shared state (control thread + audio callbacks) ──────────────────────────
 
+/// A successfully opened device stream, keyed by node id in `Shared::open_streams`.
+/// `mode` is the `device_mode` in effect when the open was attempted — comparing it
+/// (not the backend that actually succeeded) means a replay under the same settings
+/// is a no-op, while a device-mode change still reopens the stream.
+struct OpenStream {
+    device_id: String,
+    mode: u32,
+}
+
 struct Shared {
     nodes: Mutex<HashMap<String, Arc<NodeState>>>,
     edges: Mutex<Vec<Edge>>,
     snapshot: ArcSwap<GraphSnapshot>,
-    // Live device buffer sizes (frames) + sample rate, for the latency estimate.
-    in_frames: AtomicU32,
-    out_frames: AtomicU32,
+    // Master sample rate (the output device's), published by the output callback.
     sr: AtomicU32,
     // Adaptive-cushion margin bounds (ms, f32 bits), set by `set_latency_mode`.
     min_margin_ms: AtomicU32,
@@ -368,6 +398,10 @@ struct Shared {
     // Output device backend: 0 = cpal shared (default), 1 = WASAPI IAudioClient3
     // low-latency. Read when an output stream is (re)opened; set by `set_device_mode`.
     device_mode: AtomicU32,
+    // Live streams (maintained by the audio thread). Lets replayed renderer ops —
+    // a window reload / tray-window recreate re-runs the whole graph build — detect
+    // "already open exactly like this" and no-op instead of reopening (audible gap).
+    open_streams: Mutex<HashMap<String, OpenStream>>,
 }
 
 pub struct Engine {
@@ -381,12 +415,11 @@ impl Engine {
             nodes: Mutex::new(HashMap::new()),
             edges: Mutex::new(Vec::new()),
             snapshot: ArcSwap::from_pointee(GraphSnapshot::empty()),
-            in_frames: AtomicU32::new(0),
-            out_frames: AtomicU32::new(0),
             sr: AtomicU32::new(0),
             min_margin_ms: AtomicU32::new(DEFAULT_MIN_MARGIN_MS.to_bits()),
             max_margin_ms: AtomicU32::new(DEFAULT_MAX_MARGIN_MS.to_bits()),
             device_mode: AtomicU32::new(0),
+            open_streams: Mutex::new(HashMap::new()),
         });
         let (tx, rx) = channel::<Command>();
         let thread_shared = shared.clone();
@@ -402,6 +435,38 @@ impl Engine {
     pub fn create_node(&self, id: &str, node_type: &str, channels: u32, device_id: &str) {
         let kind = Kind::from_type(node_type);
         let ch = (channels.max(1)) as usize;
+
+        // Replay idempotence: the renderer re-runs the whole graph build on every
+        // window reload (F5 / HMR / tray-window recreate). If this node already
+        // exists with the same shape, keep its live state — DSP delay lines, meters,
+        // rings, gain/mute, open streams — instead of resetting it, so reloads are
+        // gapless. A different kind or channel count still replaces the node (that
+        // is exactly what setChannelCount relies on).
+        {
+            let nodes = self.shared.nodes.lock().unwrap();
+            if let Some(existing) = nodes.get(id) {
+                if existing.kind == kind && existing.channels == ch {
+                    if kind != Kind::Input {
+                        return;
+                    }
+                    // Inputs also own a capture stream: keep it when it already
+                    // matches the requested device under the current device mode,
+                    // else reopen just the stream (node state survives — this also
+                    // makes recoverInputs' re-create cheaper than a full reset).
+                    if self.stream_matches(id, device_id) {
+                        return;
+                    }
+                    *existing.device.lock().unwrap() = device_id.to_string();
+                    drop(nodes);
+                    let _ = self.tx.send(Command::DropStream { id: id.to_string() });
+                    let _ = self.tx.send(Command::CreateInputStream {
+                        id: id.to_string(),
+                        device_id: device_id.to_string(),
+                    });
+                    return;
+                }
+            }
+        }
 
         let meters_count = match kind {
             Kind::Mixer | Kind::Input | Kind::Output => 1,
@@ -456,6 +521,9 @@ impl Engine {
             ring_frames: AtomicU32::new(0),
             adapt_margin: AtomicU32::new(DEFAULT_MIN_MARGIN_MS.to_bits()),
             clean_blocks: AtomicU32::new(0),
+            block_frames: AtomicU32::new(0),
+            push_rs: Mutex::new(PushResample::default()),
+            device: Mutex::new(device_id.to_string()),
         });
 
         self.shared.nodes.lock().unwrap().insert(id.to_string(), node);
@@ -526,7 +594,27 @@ impl Engine {
         (median(&mut inputs) + median(&mut outputs)).round() as f64
     }
 
+    /// True when `id`'s stream is already open on `device_id` under the current
+    /// device mode — a replayed device set can then be a no-op instead of an
+    /// audible drop + reopen.
+    fn stream_matches(&self, id: &str, device_id: &str) -> bool {
+        let mode = self.shared.device_mode.load(Ordering::Relaxed);
+        self.shared
+            .open_streams
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|s| s.device_id == device_id && s.mode == mode)
+            .unwrap_or(false)
+    }
+
     pub fn set_input_device(&self, id: &str, device_id: &str) {
+        if let Some(n) = self.shared.nodes.lock().unwrap().get(id) {
+            *n.device.lock().unwrap() = device_id.to_string();
+        }
+        if self.stream_matches(id, device_id) {
+            return;
+        }
         let _ = self.tx.send(Command::DropStream { id: id.to_string() });
         let _ = self.tx.send(Command::CreateInputStream {
             id: id.to_string(),
@@ -535,6 +623,12 @@ impl Engine {
     }
 
     pub fn set_output_device(&self, id: &str, device_id: &str) {
+        if let Some(n) = self.shared.nodes.lock().unwrap().get(id) {
+            *n.device.lock().unwrap() = device_id.to_string();
+        }
+        if self.stream_matches(id, device_id) {
+            return;
+        }
         let _ = self.tx.send(Command::DropStream { id: id.to_string() });
         let _ = self.tx.send(Command::CreateOutputStream {
             id: id.to_string(),
@@ -579,13 +673,54 @@ impl Engine {
         }
     }
 
-    /// Feed captured PCM (interleaved stereo f32) into a loopback (application)
-    /// node's ring. Called from the renderer's getDisplayMedia capture over IPC.
-    pub fn push_capture(&self, id: &str, samples: &[f32]) {
+    /// Feed captured PCM (interleaved stereo f32 at `sample_rate`) into a loopback
+    /// (application / file-player) node's ring. Called from the renderer bridge over
+    /// IPC. Resamples to the master rate when the bridge's AudioContext runs at a
+    /// different device rate (same streaming linear resampler as `input_cb` — without
+    /// it a 44.1 k bridge into a 48 k master pitch-shifts and drifts), and records the
+    /// chunk size as this ring's cushion block term.
+    pub fn push_capture(&self, id: &str, samples: &[f32], sample_rate: f64) {
         let nodes = self.shared.nodes.lock().unwrap();
-        if let Some(node) = nodes.get(id) {
+        let Some(node) = nodes.get(id) else { return };
+        let frames = samples.len() / 2;
+        if frames == 0 {
+            return;
+        }
+        let master = self.shared.sr.load(Ordering::Relaxed) as f32;
+        let in_sr = sample_rate as f32;
+        let mut rs = node.push_rs.lock().unwrap();
+        if master < 1.0 || in_sr < 1.0 || (master - in_sr).abs() <= 0.5 {
+            // Matched rate (or master not yet known): pass through 1:1, keeping
+            // resampler continuity in case the rate diverges on a later push.
+            node.block_frames.store(frames.min(MAX_BLOCK_FRAMES) as u32, Ordering::Relaxed);
             if let Some(prod) = node.producer.lock().unwrap().as_mut() {
                 prod.push_slice(samples);
+            }
+            rs.prev_l = samples[(frames - 1) * 2];
+            rs.prev_r = samples[(frames - 1) * 2 + 1];
+            rs.pos = 0.0;
+            return;
+        }
+        let step = in_sr / master;
+        let PushResample { prev_l, prev_r, pos, out } = &mut *rs;
+        out.clear();
+        for i in 0..frames {
+            let cur_l = samples[2 * i];
+            let cur_r = samples[2 * i + 1];
+            while *pos < 1.0 {
+                out.push(*prev_l + (cur_l - *prev_l) * *pos);
+                out.push(*prev_r + (cur_r - *prev_r) * *pos);
+                *pos += step;
+            }
+            *pos -= 1.0;
+            *prev_l = cur_l;
+            *prev_r = cur_r;
+        }
+        let pushed = out.len() / 2;
+        if pushed > 0 {
+            node.block_frames.store(pushed.min(MAX_BLOCK_FRAMES) as u32, Ordering::Relaxed);
+            if let Some(prod) = node.producer.lock().unwrap().as_mut() {
+                prod.push_slice(out);
             }
         }
     }
@@ -918,12 +1053,16 @@ fn eval(
         {
             let mut guard = node.consumer.lock().unwrap();
             if let Some(cons) = guard.as_mut() {
-                // Adaptive margin (ms) on top of one device block, clamped to the live
-                // latency-mode bounds. target = (block + margin) frames, interleaved-stereo.
+                // Adaptive margin (ms) on top of one fill block, clamped to the live
+                // latency-mode bounds. The block term is *this ring's* producer block
+                // (device callback or push_capture chunk) maxed with the output block —
+                // the worst-case phase offset between a whole-block fill and a
+                // whole-block read. target = (block + margin) frames, interleaved-stereo.
                 let mut margin_ms =
                     f32::from_bits(node.adapt_margin.load(Ordering::Relaxed)).clamp(cfg.min_ms, cfg.max_ms);
                 let margin_frames = (sr * margin_ms / 1000.0) as usize;
-                let target = (cfg.block + margin_frames) * 2;
+                let block = (node.block_frames.load(Ordering::Relaxed) as usize).max(cfg.block);
+                let target = (block + margin_frames) * 2;
                 // Re-center cap tracks the target: allow a fixed drift margin above it
                 // before trimming back, so steady-state latency stays near target instead
                 // of accumulating delay from slow clock drift.
@@ -932,7 +1071,10 @@ fn eval(
                 // Real in-flight latency for the readout (interleaved-stereo → mono frames).
                 node.ring_frames.store((avail / 2) as u32, Ordering::Relaxed);
                 // Build the cushion before the first read so jitter can't underrun.
-                if !node.primed.load(Ordering::Relaxed) && avail >= target + n {
+                // `target` already holds one fill block + the jitter margin, so after
+                // the first pop the ring still keeps ≥ margin frames in reserve —
+                // waiting for more than `target` would just be permanent extra latency.
+                if !node.primed.load(Ordering::Relaxed) && avail >= target {
                     node.primed.store(true, Ordering::Relaxed);
                 }
                 if node.primed.load(Ordering::Relaxed) {
@@ -1046,6 +1188,40 @@ fn eval(
     acc
 }
 
+/// Register the calling thread with MMCSS as "Pro Audio" — the scheduling boost
+/// Windows pro-audio apps rely on to keep callbacks hitting their deadlines under
+/// CPU load. cpal 0.15.3 does **not** self-register (verified against the vendored
+/// source — re-check on a cpal upgrade) and runs one dedicated thread per stream,
+/// so this is called from inside the stream callbacks and registers each thread
+/// once. The avrt handle is intentionally leaked: the registration dies with the
+/// thread. Non-fatal on failure (MMCSS can be disabled system-wide).
+#[cfg(windows)]
+fn register_mmcss_once() {
+    use std::cell::Cell;
+    thread_local! {
+        static REGISTERED: Cell<bool> = const { Cell::new(false) };
+    }
+    REGISTERED.with(|r| {
+        if r.get() {
+            return;
+        }
+        r.set(true);
+        let mut task_index = 0u32;
+        let res = unsafe {
+            windows::Win32::System::Threading::AvSetMmThreadCharacteristicsW(
+                windows::core::w!("Pro Audio"),
+                &mut task_index,
+            )
+        };
+        if let Err(e) = res {
+            eprintln!("[audio] MMCSS 'Pro Audio' registration failed: {e}");
+        }
+    });
+}
+
+#[cfg(not(windows))]
+fn register_mmcss_once() {}
+
 // ── Audio thread: owns the cpal streams ──────────────────────────────────────
 
 fn audio_thread(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Command>) {
@@ -1062,13 +1238,14 @@ fn audio_thread(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Command>) {
         match cmd {
             Command::CreateInputStream { id, device_id } => {
                 streams.remove(&id);
+                shared.open_streams.lock().unwrap().remove(&id);
+                let mode = shared.device_mode.load(Ordering::Relaxed);
                 let mut opened = false;
                 // Low-latency / exclusive capture uses the WASAPI default input endpoint
                 // (device_id == "" ⇒ default); any failure falls back to cpal below.
                 #[cfg(windows)]
                 {
                     wasapi_ins.remove(&id);
-                    let mode = shared.device_mode.load(Ordering::Relaxed);
                     if (mode == 1 || mode == 2) && device_id.is_empty() {
                         let exclusive = mode == 2;
                         match wasapi::WasapiInput::start(shared.clone(), id.clone(), exclusive) {
@@ -1089,14 +1266,24 @@ fn audio_thread(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Command>) {
                             if let Err(e) = stream.play() {
                                 eprintln!("[audio] input play failed: {e}");
                             }
-                            streams.insert(id, stream);
+                            streams.insert(id.clone(), stream);
+                            opened = true;
                         }
                         Err(e) => eprintln!("[audio] open input '{device_id}' failed: {e}"),
                     }
                 }
+                if opened {
+                    shared
+                        .open_streams
+                        .lock()
+                        .unwrap()
+                        .insert(id, OpenStream { device_id, mode });
+                }
             }
             Command::CreateOutputStream { id, device_id } => {
                 streams.remove(&id);
+                shared.open_streams.lock().unwrap().remove(&id);
+                let mode = shared.device_mode.load(Ordering::Relaxed);
                 let mut opened = false;
                 // Low-latency mode uses the WASAPI IAudioClient3 default render endpoint
                 // (device_id == "" ⇒ default). Any failure falls back to cpal below, so
@@ -1104,7 +1291,6 @@ fn audio_thread(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Command>) {
                 #[cfg(windows)]
                 {
                     wasapi_outs.remove(&id);
-                    let mode = shared.device_mode.load(Ordering::Relaxed);
                     if (mode == 1 || mode == 2) && device_id.is_empty() {
                         let exclusive = mode == 2;
                         match wasapi::WasapiOutput::start(shared.clone(), id.clone(), exclusive) {
@@ -1125,14 +1311,23 @@ fn audio_thread(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Command>) {
                             if let Err(e) = stream.play() {
                                 eprintln!("[audio] output play failed: {e}");
                             }
-                            streams.insert(id, stream);
+                            streams.insert(id.clone(), stream);
+                            opened = true;
                         }
                         Err(e) => eprintln!("[audio] open output '{device_id}' failed: {e}"),
                     }
                 }
+                if opened {
+                    shared
+                        .open_streams
+                        .lock()
+                        .unwrap()
+                        .insert(id, OpenStream { device_id, mode });
+                }
             }
             Command::DropStream { id } => {
                 streams.remove(&id);
+                shared.open_streams.lock().unwrap().remove(&id);
                 #[cfg(windows)]
                 {
                     wasapi_outs.remove(&id);
@@ -1250,8 +1445,8 @@ where
     let mut pos = 0.0f32; // position (in input frames) of the next output sample
     let mut out: Vec<f32> = Vec::with_capacity(MAX_BLOCK_FRAMES * 4);
     move |data: &[T], info: &cpal::InputCallbackInfo| {
+        register_mmcss_once();
         let frames = data.len() / in_ch;
-        shared.in_frames.store(frames.min(MAX_BLOCK_FRAMES) as u32, Ordering::Relaxed);
         let master = shared.sr.load(Ordering::Relaxed) as f32;
 
         // Real input device latency: how long ago this block was captured (cpal QPC
@@ -1301,6 +1496,13 @@ where
                 prev_r = cur_r;
             }
         }
+        // This ring's fill block (master-rate frames) — the cushion's per-node term.
+        if let Some(node) = &node {
+            let pushed = out.len() / 2;
+            if pushed > 0 {
+                node.block_frames.store(pushed.min(MAX_BLOCK_FRAMES) as u32, Ordering::Relaxed);
+            }
+        }
         prod.push_slice(&out);
     }
 }
@@ -1348,18 +1550,18 @@ fn render_output(
     sr: f32,
     dev_ms: f32,
 ) -> Vec<f32> {
-    shared.out_frames.store(frames as u32, Ordering::Relaxed);
     shared.sr.store(sr as u32, Ordering::Relaxed);
-    // Per-block cushion config: one device block + the adaptive margin (clamped to the
-    // current latency-mode bounds), with a ~CLEAN_DECAY_SECS decay interval in blocks.
-    let block = shared.in_frames.load(Ordering::Relaxed).max(frames as u32) as usize;
-    let decay_blocks = if block > 0 {
-        (CLEAN_DECAY_SECS * sr / block as f32) as u32
+    // Per-block cushion config: the output block (each input maxes in its own fill
+    // block in `eval`) + the adaptive margin (clamped to the current latency-mode
+    // bounds), with a ~CLEAN_DECAY_SECS decay interval counted in *output* blocks
+    // (eval reads each ring once per output callback).
+    let decay_blocks = if frames > 0 {
+        (CLEAN_DECAY_SECS * sr / frames as f32) as u32
     } else {
         u32::MAX
     };
     let cfg = CushionCfg {
-        block,
+        block: frames,
         min_ms: f32::from_bits(shared.min_margin_ms.load(Ordering::Relaxed)),
         max_ms: f32::from_bits(shared.max_margin_ms.load(Ordering::Relaxed)),
         decay_blocks,
@@ -1403,6 +1605,7 @@ where
     let out_ch = out_ch.max(1);
     let mut st = EvalState::new();
     move |data: &mut [T], info: &OutputCallbackInfo| {
+        register_mmcss_once();
         let frames = (data.len() / out_ch).min(MAX_BLOCK_FRAMES);
         // Real output device latency: how far ahead of "now" this block plays out
         // (cpal callback→playback, i.e. the live buffer padding). Block-size fallback.

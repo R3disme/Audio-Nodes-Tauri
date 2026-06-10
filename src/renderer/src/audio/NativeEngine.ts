@@ -37,6 +37,46 @@ interface Conn {
   targetChannel: number
 }
 
+/** A running renderer→engine PCM bridge (see startCaptureBridge). */
+interface CaptureBridge {
+  stop(): void
+}
+
+// AudioWorklet processor for the capture bridge: interleaves L/R into 256-frame
+// chunks (~5.3 ms at 48 kHz) and posts each to the main thread with a transferred
+// buffer. Small chunks matter: the engine sizes each fed ring's latency cushion to
+// its push cadence, so a 2048-frame push forces a ~43 ms cushion while 256 needs ~5.
+// Missing input channels (e.g. a paused/ended source) emit silence at the same
+// cadence so the engine ring stays primed. Loaded as a Blob module (CSP allows
+// worker-src blob:), same pattern as the bitcrusher worklet in AudioEngine.ts.
+const CAPTURE_BRIDGE_WORKLET = `
+class CaptureBridgeProcessor extends AudioWorkletProcessor {
+  constructor () {
+    super()
+    this.chunk = 256
+    this.buf = new Float32Array(this.chunk * 2)
+    this.fill = 0
+  }
+  process (inputs) {
+    const inp = inputs[0]
+    const L = inp && inp.length > 0 ? inp[0] : null
+    const R = inp && inp.length > 1 ? inp[1] : L
+    const n = L ? L.length : 128
+    for (let i = 0; i < n; i++) {
+      this.buf[2 * this.fill] = L ? L[i] : 0
+      this.buf[2 * this.fill + 1] = R ? R[i] : 0
+      if (++this.fill === this.chunk) {
+        this.port.postMessage(this.buf, [this.buf.buffer])
+        this.buf = new Float32Array(this.chunk * 2)
+        this.fill = 0
+      }
+    }
+    return true
+  }
+}
+registerProcessor('capture-bridge', CaptureBridgeProcessor)
+`
+
 class NativeEngine implements AudioBackend {
   private initialized = false
   private meterSubs = new Map<string, Set<(db: number) => void>>()
@@ -77,14 +117,40 @@ class NativeEngine implements AudioBackend {
       console.warn('[native engine] init failed:', e)
     }
     this.startMeterLoop()
+    this.startLatencyPoll()
 
-    // Latency is reported by the engine from its live device buffer sizes. Poll it
-    // on a slow timer and cache it, since getLatencyMs() is synchronous.
+    // Minimized / hidden in the tray: the renderer has no visible meters and the
+    // native gate runs on the Rust audio thread, so suspend the rAF loop and the
+    // latency poll entirely (zero renderer wakeups) and resume on show.
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          this.stopMeterLoop()
+          this.stopLatencyPoll()
+        } else {
+          this.startMeterLoop()
+          this.startLatencyPoll()
+        }
+      })
+    }
+  }
+
+  // Latency is reported by the engine from its live device buffer sizes. Poll it
+  // on a slow timer and cache it, since getLatencyMs() is synchronous.
+  private startLatencyPoll(): void {
     const pollLatency = (): void => {
       window.api.audio.latency().then(v => { this.latencyCache = v }).catch(() => {})
     }
     pollLatency()
+    if (this.latencyTimer !== null) window.clearInterval(this.latencyTimer)
     this.latencyTimer = window.setInterval(pollLatency, 2000)
+  }
+
+  private stopLatencyPoll(): void {
+    if (this.latencyTimer !== null) {
+      window.clearInterval(this.latencyTimer)
+      this.latencyTimer = null
+    }
   }
 
   getLatencyMs(): number {
@@ -106,10 +172,7 @@ class NativeEngine implements AudioBackend {
     let busy = false
     const tick = (): void => {
       this.rafId = requestAnimationFrame(tick)
-      // Minimized / hidden in the tray: stop polling the engine for meters (saves
-      // a per-frame IPC round-trip). The native gate runs on the audio thread, so
-      // it's unaffected. Resumes automatically when the window is shown again.
-      if (busy || this.meterSubs.size === 0 || (typeof document !== 'undefined' && document.hidden)) return
+      if (busy || this.meterSubs.size === 0) return
       busy = true
       window.api.audio
         .pollMeters()
@@ -134,6 +197,13 @@ class NativeEngine implements AudioBackend {
     this.rafId = requestAnimationFrame(tick)
   }
 
+  private stopMeterLoop(): void {
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId)
+      this.rafId = null
+    }
+  }
+
   subscribeMeter(key: string, cb: (db: number) => void): () => void {
     let set = this.meterSubs.get(key)
     if (!set) {
@@ -156,6 +226,17 @@ class NativeEngine implements AudioBackend {
   }
   private notifyNodeChanges(): void {
     for (const cb of this.nodeSubs) cb()
+  }
+
+  /** True while any renderer-side PCM bridge feeds the native engine (app capture,
+   *  loaded file player) or a recording is in progress — i.e. destroying the
+   *  renderer window would break audio even though the engine lives in main. */
+  hasActiveBridges(): boolean {
+    if (this.appCaptures.size > 0 || this.recording.size > 0) return true
+    for (const fp of this.filePlayers.values()) {
+      if (fp.el.src) return true
+    }
+    return false
   }
 
   getCompressorReduction(id: string, channel = 0): number {
@@ -214,11 +295,72 @@ class NativeEngine implements AudioBackend {
     }
   }
 
+  // ── Capture bridge (application capture + file player) ────────────────────
+
+  /** Pump `source`'s PCM into `id`'s fed engine ring (Kind::Loopback) over IPC
+   *  (`pushCapture`, which also carries the bridge context's sample rate so the
+   *  engine can resample to its master rate). An AudioWorklet posts 256-frame
+   *  chunks; if the worklet can't load it falls back to the old 2048-frame
+   *  ScriptProcessor so capture never breaks. The 0-gain sink keeps the graph
+   *  rendering without playing the bridged audio out of the speakers (and keeps
+   *  the ring primed with silence while the source is paused). */
+  private async startCaptureBridge(ctx: AudioContext, source: AudioNode, id: string): Promise<CaptureBridge> {
+    const gain = ctx.createGain()
+    gain.gain.value = 0
+    let proc: AudioWorkletNode | ScriptProcessorNode
+    try {
+      const url = URL.createObjectURL(new Blob([CAPTURE_BRIDGE_WORKLET], { type: 'application/javascript' }))
+      try {
+        await ctx.audioWorklet.addModule(url)
+      } finally {
+        URL.revokeObjectURL(url)
+      }
+      const node = new AudioWorkletNode(ctx, 'capture-bridge', {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        channelCount: 2,
+        channelCountMode: 'explicit'
+      })
+      node.port.onmessage = (e: MessageEvent<Float32Array>): void => {
+        window.api.audio.pushCapture(id, e.data, ctx.sampleRate)
+      }
+      proc = node
+    } catch (e) {
+      console.warn('[native engine] capture worklet failed; falling back to ScriptProcessor:', e)
+      const sp = ctx.createScriptProcessor(2048, 2, 1)
+      // Reused across callbacks; Electron copies the IPC arg synchronously on send,
+      // so mutating it afterwards is safe — avoids ~4 KB of GC garbage every block.
+      let inter = new Float32Array(2048 * 2)
+      sp.onaudioprocess = (ev): void => {
+        const inp = ev.inputBuffer
+        const L = inp.getChannelData(0)
+        const R = inp.numberOfChannels > 1 ? inp.getChannelData(1) : L
+        const n = inp.length
+        if (inter.length !== n * 2) inter = new Float32Array(n * 2)
+        for (let i = 0; i < n; i++) { inter[2 * i] = L[i]; inter[2 * i + 1] = R[i] }
+        window.api.audio.pushCapture(id, inter, ctx.sampleRate)
+      }
+      proc = sp
+    }
+    source.connect(proc)
+    proc.connect(gain)
+    gain.connect(ctx.destination)
+    return {
+      stop: (): void => {
+        try {
+          if (proc instanceof AudioWorkletNode) proc.port.onmessage = null
+          else proc.onaudioprocess = null
+          proc.disconnect()
+          source.disconnect()
+          gain.disconnect()
+        } catch { /* already torn down */ }
+      }
+    }
+  }
+
   // The renderer captures system audio with getDisplayMedia (proven, same as the
   // Web Audio engine) and bridges the PCM into the native engine's loopback ring.
-  private appCaptures = new Map<string, {
-    ctx: AudioContext; stream: MediaStream; src: MediaStreamAudioSourceNode; proc: ScriptProcessorNode; gain: GainNode
-  }>()
+  private appCaptures = new Map<string, { ctx: AudioContext; stream: MediaStream; bridge: CaptureBridge }>()
 
   async createApplicationNode(id: string, _sourceId: string, _sourceName: string): Promise<void> {
     window.api.audio.createNode(id, 'application', 1, '')
@@ -234,29 +376,11 @@ class NativeEngine implements AudioBackend {
       const tracks = stream.getAudioTracks()
       if (tracks.length === 0) return
       const audioOnly = new MediaStream(tracks)
-      const ctx = new AudioContext()
+      const ctx = new AudioContext({ latencyHint: 'interactive' })
       const src = ctx.createMediaStreamSource(audioOnly)
-      // ScriptProcessor only runs while connected to a destination; a 0-gain node
-      // keeps it pumping without playing the captured audio back out the speakers.
-      const proc = ctx.createScriptProcessor(2048, 2, 1)
-      const gain = ctx.createGain()
-      gain.gain.value = 0
-      // Reused across callbacks (ScriptProcessor block size is fixed); Electron copies
-      // the IPC arg synchronously on send, so mutating it afterwards is safe — avoids
-      // ~4 KB of GC garbage every block.
-      let inter = new Float32Array(2048 * 2)
-      proc.onaudioprocess = (e): void => {
-        const inp = e.inputBuffer
-        const L = inp.getChannelData(0)
-        const R = inp.numberOfChannels > 1 ? inp.getChannelData(1) : L
-        const n = inp.length
-        if (inter.length !== n * 2) inter = new Float32Array(n * 2)
-        for (let i = 0; i < n; i++) { inter[2 * i] = L[i]; inter[2 * i + 1] = R[i] }
-        window.api.audio.pushCapture(id, inter)
-      }
-      src.connect(proc); proc.connect(gain); gain.connect(ctx.destination)
+      const bridge = await this.startCaptureBridge(ctx, src, id)
       tracks[0].onended = () => { this.stopAppCapture(id) }
-      this.appCaptures.set(id, { ctx, stream: audioOnly, src, proc, gain })
+      this.appCaptures.set(id, { ctx, stream: audioOnly, bridge })
       this.notifyNodeChanges()
     } catch (e) {
       console.warn('[native engine] application capture failed:', e)
@@ -266,7 +390,7 @@ class NativeEngine implements AudioBackend {
   private stopAppCapture(id: string): void {
     const c = this.appCaptures.get(id)
     if (!c) return
-    try { c.proc.onaudioprocess = null; c.proc.disconnect(); c.src.disconnect(); c.gain.disconnect() } catch { /* */ }
+    c.bridge.stop()
     c.stream.getTracks().forEach(t => t.stop())
     void c.ctx.close().catch(() => {})
     this.appCaptures.delete(id)
@@ -318,11 +442,13 @@ class NativeEngine implements AudioBackend {
   startRecording(id: string): boolean {
     window.api.audio.startRecording(id)
     this.recording.add(id)
+    this.notifyNodeChanges()
     return true
   }
 
   async stopRecording(id: string): Promise<{ blob: Blob; mimeType: string; extension: string } | null> {
     this.recording.delete(id)
+    this.notifyNodeChanges()
     const res = await window.api.audio.stopRecording(id)
     if (!res) return null
     // `bytes` arrives as a Uint8Array over IPC; cast to satisfy the strict BlobPart type.
@@ -335,41 +461,28 @@ class NativeEngine implements AudioBackend {
 
   // ── File player ───────────────────────────────────────────────────────────
   // Decoding + transport live in the renderer (an <audio> element, like Web Audio);
-  // the element is routed through a ScriptProcessor whose PCM is bridged into the
-  // engine's fed ring (Kind::Loopback) over IPC — the same proven path as application
-  // capture. The element plays only into the graph (not the speakers): its output goes
-  // to a 0-gain node that keeps the ScriptProcessor pumping (and the ring primed with
-  // silence while paused), exactly mirroring armApplicationCapture.
-  private filePlayers = new Map<string, {
-    ctx: AudioContext; el: HTMLAudioElement; src: MediaElementAudioSourceNode; proc: ScriptProcessorNode; gain: GainNode
-  }>()
+  // the element is routed through the capture bridge into the engine's fed ring
+  // (Kind::Loopback) over IPC — the same path as application capture. The element
+  // plays only into the graph (not the speakers); the bridge's 0-gain sink keeps it
+  // pumping (and the ring primed with silence while paused).
+  // `bridge` is null until the worklet module finishes loading — the entry goes in
+  // synchronously so loadFilePlayer/play right after creation still find it.
+  private filePlayers = new Map<string, { ctx: AudioContext; el: HTMLAudioElement; bridge: CaptureBridge | null }>()
 
   createFilePlayerNode(id: string): void {
     window.api.audio.createNode(id, 'fileplayer', 1, '')
     if (this.filePlayers.has(id)) return
     try {
-      const ctx = new AudioContext()
+      const ctx = new AudioContext({ latencyHint: 'interactive' })
       const el = new Audio()
       el.preload = 'auto'
       const src = ctx.createMediaElementSource(el)
-      const proc = ctx.createScriptProcessor(2048, 2, 1)
-      const gain = ctx.createGain()
-      gain.gain.value = 0
-      // Reused across callbacks (ScriptProcessor block size is fixed); Electron copies
-      // the IPC arg synchronously on send, so mutating it afterwards is safe — avoids
-      // ~4 KB of GC garbage every block.
-      let inter = new Float32Array(2048 * 2)
-      proc.onaudioprocess = (e): void => {
-        const inp = e.inputBuffer
-        const L = inp.getChannelData(0)
-        const R = inp.numberOfChannels > 1 ? inp.getChannelData(1) : L
-        const n = inp.length
-        if (inter.length !== n * 2) inter = new Float32Array(n * 2)
-        for (let i = 0; i < n; i++) { inter[2 * i] = L[i]; inter[2 * i + 1] = R[i] }
-        window.api.audio.pushCapture(id, inter)
-      }
-      src.connect(proc); proc.connect(gain); gain.connect(ctx.destination)
-      this.filePlayers.set(id, { ctx, el, src, proc, gain })
+      const entry = { ctx, el, bridge: null as CaptureBridge | null }
+      this.filePlayers.set(id, entry)
+      void this.startCaptureBridge(ctx, src, id).then((bridge) => {
+        if (this.filePlayers.get(id) === entry) entry.bridge = bridge
+        else bridge.stop() // torn down while the worklet was still loading
+      })
     } catch (e) {
       console.warn('[native engine] file player setup failed:', e)
     }
@@ -378,10 +491,11 @@ class NativeEngine implements AudioBackend {
   private teardownFilePlayer(id: string): void {
     const fp = this.filePlayers.get(id)
     if (!fp) return
-    try { fp.proc.onaudioprocess = null; fp.proc.disconnect(); fp.src.disconnect(); fp.gain.disconnect() } catch { /* */ }
+    fp.bridge?.stop()
     try { fp.el.pause(); fp.el.removeAttribute('src'); fp.el.load() } catch { /* */ }
     void fp.ctx.close().catch(() => {})
     this.filePlayers.delete(id)
+    this.notifyNodeChanges()
   }
 
   loadFilePlayer(id: string, url: string): void {
@@ -390,6 +504,7 @@ class NativeEngine implements AudioBackend {
     fp.el.src = url
     fp.el.load()
     void fp.ctx.resume()
+    this.notifyNodeChanges()
   }
 
   playFilePlayer(id: string): void {

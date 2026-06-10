@@ -1,16 +1,11 @@
 import { Fragment, useEffect, useState, type ReactNode } from 'react'
 import { X, ChevronLeft, ChevronRight, Power, Plus, Minimize2, ArrowRight } from 'lucide-react'
 import { nodeColor, nodeColorDark } from '@renderer/lib/nodeColors'
+import { NodeTypeIcon } from '@renderer/lib/nodeIcons'
 
 interface GuidePanelProps {
   open: boolean
   onClose: () => void
-}
-
-const NODE_ICON: Record<string, string> = {
-  input: '🎙', fileplayer: '🎵', application: '🪟', volume: '🔈', eq: '🎚',
-  compressor: '📉', gate: '🚪', pan: '↔', reverb: '🏛', delay: '🔁', chorus: '🌀',
-  distortion: '⚡', mixer: '🎛', output: '🔊', virtual: '🎧', recorder: '⏺'
 }
 
 // ── Visual primitives ───────────────────────────────────────────────────────
@@ -27,7 +22,7 @@ function MiniNode({ type, label, sockets = 'both', w = 104 }: {
       <div className="rounded-md overflow-hidden ring-1 ring-black/50 shadow-lg" style={{ background: 'linear-gradient(180deg, var(--c-surface-2), var(--c-surface-3))' }}>
         <div className="px-1.5 py-1 flex items-center gap-1 text-[9px] font-semibold text-white"
              style={{ background: `linear-gradient(180deg, rgba(255,255,255,0.16), rgba(0,0,0,0.22)), ${nodeColor(type)}` }}>
-          <span className="leading-none drop-shadow">{NODE_ICON[type] ?? '▪'}</span>
+          <NodeTypeIcon type={type} size={9} className="shrink-0 drop-shadow" />
           <span className="truncate drop-shadow-sm">{label}</span>
         </div>
         <div className="px-1.5 py-2 flex flex-col gap-1">
@@ -107,7 +102,7 @@ const STEPS: Step[] = [
         <div className="flex flex-col gap-1.5">
           {['input', 'eq', 'reverb'].map(t => (
             <div key={t} className="flex items-center gap-1.5 px-2 py-1 rounded text-[10px]" style={{ background: 'var(--c-surface-2)', border: '1px solid var(--c-border)', color: 'var(--c-text)' }}>
-              <span className="w-5 h-5 rounded flex items-center justify-center text-[11px]" style={{ background: nodeColor(t) }}>{NODE_ICON[t]}</span>
+              <span className="w-5 h-5 rounded flex items-center justify-center text-white/90" style={{ background: nodeColor(t) }}><NodeTypeIcon type={t} size={11} /></span>
               <span className="capitalize">{t}</span>
             </div>
           ))}

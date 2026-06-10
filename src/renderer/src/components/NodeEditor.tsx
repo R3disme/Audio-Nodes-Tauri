@@ -11,6 +11,7 @@ import {
   useReactFlow
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
+import { SlidersVertical } from 'lucide-react'
 import { useAudioStore } from '@renderer/store/audioStore'
 import { InputNode } from './nodes/InputNode'
 import { OutputNode } from './nodes/OutputNode'
@@ -228,7 +229,7 @@ function NodeEditorInner(): JSX.Element {
           <Panel position="top-center" style={{ marginTop: 72 }}>
             <div className="rounded-xl px-5 py-4 text-xs shadow-2xl backdrop-blur text-center max-w-md"
                  style={{ background: 'color-mix(in srgb, var(--c-surface) 85%, transparent)', border: '1px solid var(--c-border)', color: 'var(--c-text-dim)' }}>
-              <div className="text-2xl mb-1.5">🎛</div>
+              <div className="mb-1.5 flex justify-center"><SlidersVertical size={24} style={{ color: 'var(--c-accent)' }} /></div>
               <div className="font-semibold text-sm mb-1" style={{ color: 'var(--c-text)' }}>Build your audio chain</div>
               <div className="leading-relaxed">
                 Click a node in the sidebar — or drag it onto the canvas — then wire

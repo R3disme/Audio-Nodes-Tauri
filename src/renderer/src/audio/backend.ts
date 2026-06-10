@@ -50,19 +50,40 @@ export function setActiveEngine(kind: EngineKind): void {
 }
 
 /**
+ * Tell the main process which engine is live and whether any renderer-side PCM
+ * bridge (app capture / loaded file player / recording) is active. Main only
+ * destroys the hidden tray window when the engine is native AND nothing in the
+ * renderer is load-bearing for audio. On Web Audio the renderer IS the engine,
+ * so it always reports busy.
+ */
+export function reportBackgroundState(): void {
+  const busy = activeKind === 'native' ? nativeEngine.hasActiveBridges() : true
+  try {
+    window.api.reportBackgroundState({ engine: activeKind, busy })
+  } catch {
+    /* preload bridge unavailable (tests) — main keeps its safe default */
+  }
+}
+
+/**
  * If native is selected but the Rust addon isn't built/available, fall back to
  * Web Audio for this session (without changing the persisted setting) so the app
  * never goes silent on a fresh clone. Call once at startup before init.
  */
 export async function ensureBackendAvailable(): Promise<void> {
-  if (activeKind !== 'native') return
-  try {
-    const info = await window.api.audio.info()
-    if (!info) throw new Error('addon unavailable')
-  } catch {
-    console.warn('[backend] native engine unavailable — using Web Audio this session. Run "npm run build:native" to enable native.')
-    setActiveEngine('webaudio')
+  if (activeKind === 'native') {
+    try {
+      const info = await window.api.audio.info()
+      if (!info) throw new Error('addon unavailable')
+    } catch {
+      console.warn('[backend] native engine unavailable — using Web Audio this session. Run "npm run build:native" to enable native.')
+      setActiveEngine('webaudio')
+    }
   }
+  // The session's engine is final now: report the background state and keep it
+  // fresh as bridges come and go (NativeEngine notifies on every bridge change).
+  nativeEngine.subscribeNodeChanges(reportBackgroundState)
+  reportBackgroundState()
 }
 
 /**
@@ -73,6 +94,14 @@ export async function ensureBackendAvailable(): Promise<void> {
 export const audioEngine: AudioBackend = new Proxy({} as AudioBackend, {
   get(_target, prop: string | symbol) {
     const value = (active as unknown as Record<string | symbol, unknown>)[prop]
+    // The facade is untyped per-call, so a method present on one engine but missing
+    // from the other fails *silently* at the call site (`undefined` is not callable
+    // only once actually invoked). Surface the mismatch loudly in the console —
+    // but still return undefined, since optional-feature probes legitimately read
+    // missing members.
+    if (value === undefined && typeof prop === 'string' && prop !== 'then') {
+      console.error(`[backend] audioEngine.${prop} is missing on the active '${activeKind}' engine — AudioBackend.ts and both implementations must change in lockstep`)
+    }
     return typeof value === 'function'
       ? (value as (...args: unknown[]) => unknown).bind(active)
       : value

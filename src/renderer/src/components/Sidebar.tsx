@@ -2,39 +2,39 @@ import { PanelLeftClose, ChevronsRight } from 'lucide-react'
 import { useAudioStore } from '@renderer/store/audioStore'
 import { useSettingsStore } from '@renderer/store/settingsStore'
 import { nodeColor } from '@renderer/lib/nodeColors'
+import { NodeTypeIcon } from '@renderer/lib/nodeIcons'
 
 type Category = 'source' | 'effect' | 'creative' | 'sink' | 'mix'
 
 interface NodeEntry {
   type: string
   label: string
-  icon: string
   description: string
   category: Category
 }
 
 const NODE_PALETTE: NodeEntry[] = [
-  { type: 'input',       label: 'Input',        icon: '🎙', description: 'Microphone, line-in',     category: 'source' },
-  { type: 'fileplayer',  label: 'File Player',  icon: '🎵', description: 'Play an audio file',      category: 'source' },
-  { type: 'application', label: 'Application',  icon: '🪟', description: 'Capture window audio',     category: 'source' },
-  { type: 'volume',      label: 'Volume',       icon: '🔈', description: 'Gain & mute',              category: 'effect' },
-  { type: 'eq',          label: 'Equalizer',    icon: '🎚', description: '5-band parametric EQ',     category: 'effect' },
-  { type: 'compressor',  label: 'Compressor',   icon: '📉', description: 'Dynamics control',         category: 'effect' },
-  { type: 'gate',        label: 'Gate',         icon: '🚪', description: 'Silence below threshold',  category: 'effect' },
-  { type: 'expander',    label: 'Expander',     icon: '📈', description: 'Downward dynamics expand', category: 'effect' },
-  { type: 'limiter',     label: 'Limiter',      icon: '🧱', description: 'Brickwall peak ceiling',   category: 'effect' },
-  { type: 'filter',      label: 'Filter',       icon: '🔉', description: 'LP/HP/BP/notch filter',    category: 'effect' },
-  { type: 'pan',         label: 'Pan',          icon: '↔', description: 'Stereo placement',         category: 'effect' },
-  { type: 'reverb',      label: 'Reverb',       icon: '🏛', description: 'Vocal space & ambience',   category: 'creative' },
-  { type: 'delay',       label: 'Delay / Echo', icon: '🔁', description: 'Echo with feedback',       category: 'creative' },
-  { type: 'chorus',      label: 'Chorus',       icon: '🌀', description: 'Thicken & double vocals',  category: 'creative' },
-  { type: 'tremolo',     label: 'Tremolo',      icon: '〰', description: 'LFO amplitude / auto-pan', category: 'creative' },
-  { type: 'distortion',  label: 'Distortion',   icon: '⚡', description: 'Saturation & drive',       category: 'creative' },
-  { type: 'bitcrusher',  label: 'Bitcrusher',   icon: '👾', description: 'Lo-fi bit / rate crush',   category: 'creative' },
-  { type: 'mixer',       label: 'Mixer',        icon: '🎛', description: '4-channel sum',            category: 'mix' },
-  { type: 'output',      label: 'Output',       icon: '🔊', description: 'Speakers / headphones',    category: 'sink' },
-  { type: 'virtual',     label: 'Virtual Out',  icon: '🎧', description: 'Route to other apps',      category: 'sink' },
-  { type: 'recorder',    label: 'Recorder',     icon: '⏺', description: 'Capture audio to a file',  category: 'sink' }
+  { type: 'input',       label: 'Input',        description: 'Microphone, line-in',     category: 'source' },
+  { type: 'fileplayer',  label: 'File Player',  description: 'Play an audio file',      category: 'source' },
+  { type: 'application', label: 'Application',  description: 'Capture window audio',     category: 'source' },
+  { type: 'volume',      label: 'Volume',       description: 'Gain & mute',              category: 'effect' },
+  { type: 'eq',          label: 'Equalizer',    description: '5-band parametric EQ',     category: 'effect' },
+  { type: 'compressor',  label: 'Compressor',   description: 'Dynamics control',         category: 'effect' },
+  { type: 'gate',        label: 'Gate',         description: 'Silence below threshold',  category: 'effect' },
+  { type: 'expander',    label: 'Expander',     description: 'Downward dynamics expand', category: 'effect' },
+  { type: 'limiter',     label: 'Limiter',      description: 'Brickwall peak ceiling',   category: 'effect' },
+  { type: 'filter',      label: 'Filter',       description: 'LP/HP/BP/notch filter',    category: 'effect' },
+  { type: 'pan',         label: 'Pan',          description: 'Stereo placement',         category: 'effect' },
+  { type: 'reverb',      label: 'Reverb',       description: 'Vocal space & ambience',   category: 'creative' },
+  { type: 'delay',       label: 'Delay / Echo', description: 'Echo with feedback',       category: 'creative' },
+  { type: 'chorus',      label: 'Chorus',       description: 'Thicken & double vocals',  category: 'creative' },
+  { type: 'tremolo',     label: 'Tremolo',      description: 'LFO amplitude / auto-pan', category: 'creative' },
+  { type: 'distortion',  label: 'Distortion',   description: 'Saturation & drive',       category: 'creative' },
+  { type: 'bitcrusher',  label: 'Bitcrusher',   description: 'Lo-fi bit / rate crush',   category: 'creative' },
+  { type: 'mixer',       label: 'Mixer',        description: '4-channel sum',            category: 'mix' },
+  { type: 'output',      label: 'Output',       description: 'Speakers / headphones',    category: 'sink' },
+  { type: 'virtual',     label: 'Virtual Out',  description: 'Route to other apps',      category: 'sink' },
+  { type: 'recorder',    label: 'Recorder',     description: 'Capture audio to a file',  category: 'sink' }
 ]
 
 const CATEGORY_LABELS: Record<Category, string> = {
@@ -113,10 +113,10 @@ export function Sidebar(): JSX.Element {
                 className="flex items-center gap-2 px-1.5 py-1.5 rounded cursor-pointer hover:bg-white/5 active:bg-white/10 transition-colors select-none group"
               >
                 <div
-                  className="w-7 h-7 rounded flex items-center justify-center text-sm shrink-0 ring-1 ring-black/30 group-hover:ring-white/10 transition-all"
+                  className="w-7 h-7 rounded flex items-center justify-center text-white/90 shrink-0 ring-1 ring-black/30 group-hover:ring-white/10 transition-all"
                   style={{ background: nodeColor(entry.type) }}
                 >
-                  {entry.icon}
+                  <NodeTypeIcon type={entry.type} size={14} />
                 </div>
                 <div className="overflow-hidden min-w-0">
                   <div className="text-[11px] font-medium leading-tight" style={{ color: 'var(--c-text)' }}>{entry.label}</div>

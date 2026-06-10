@@ -315,6 +315,9 @@ class AudioEngine implements AudioBackend {
   /** Channels-count subscribers (for components that need to react to engine state). */
   private nodeSubs = new Set<() => void>()
   private rafId: number | null = null
+
+  /** Coarse gate/expander ticker used while the window is hidden (no rAF). */
+  private hiddenDynamicsTimer: number | null = null
   // Explicit ArrayBuffer backing — getFloatTimeDomainData requires Float32Array<ArrayBuffer>
   private rmsBuf: Float32Array<ArrayBuffer> = new Float32Array(new ArrayBuffer(256 * 4))
   /** Set once the bitcrusher AudioWorklet module has loaded. */
@@ -336,6 +339,34 @@ class AudioEngine implements AudioBackend {
       console.warn('Bitcrusher worklet failed to load; bitcrusher will pass through:', e)
     }
     this.startMeterLoop()
+
+    // Minimized / hidden in the tray: drop the 60 fps rAF loop entirely — nobody
+    // can see the meters. Audio still flows, so gates/expanders must keep gating:
+    // run them on a coarse interval instead (setTargetAtTime smooths between
+    // ticks). With no gates/expanders in the graph, no timer runs at all. This is
+    // the bulk of the idle-CPU saving when backgrounded (backgroundThrottling is
+    // off, so a scheduled rAF would otherwise keep waking the renderer).
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+          this.stopMeterLoop()
+          const hasDynamics = [...this.nodes.values()].some(
+            n => (n.gateRefs?.length ?? 0) > 0 || (n.expanderRefs?.length ?? 0) > 0
+          )
+          // The graph can't change while the UI is hidden, so this check holds
+          // until the window is shown again.
+          if (hasDynamics && this.hiddenDynamicsTimer === null) {
+            this.hiddenDynamicsTimer = window.setInterval(() => this.tickDynamics(), 33)
+          }
+        } else {
+          if (this.hiddenDynamicsTimer !== null) {
+            window.clearInterval(this.hiddenDynamicsTimer)
+            this.hiddenDynamicsTimer = null
+          }
+          this.startMeterLoop()
+        }
+      })
+    }
   }
 
   private get context(): AudioContext {
@@ -360,24 +391,20 @@ class AudioEngine implements AudioBackend {
     }
   }
 
-  private startMeterLoop(): void {
-    const tick = (): void => {
-      // Minimized / hidden in the tray: skip all VU-meter work (analyser reads,
-      // RMS, DOM writes) — nobody can see it. Keep ticking gates, since audio
-      // still flows and a noise gate must keep gating in the background. This is
-      // the bulk of the idle-CPU saving when backgrounded.
-      if (typeof document !== 'undefined' && document.hidden) {
-        this.nodes.forEach((node) => {
-          if (node.type === 'gate' && node.gateRefs) {
-            for (const g of node.gateRefs) this.tickGate(g)
-          } else if (node.type === 'expander' && node.expanderRefs) {
-            for (const e of node.expanderRefs) this.tickExpander(e)
-          }
-        })
-        this.rafId = requestAnimationFrame(tick)
-        return
+  /** Tick every gate/expander state machine once (meter-driven gain envelopes). */
+  private tickDynamics(): void {
+    this.nodes.forEach((node) => {
+      if (node.type === 'gate' && node.gateRefs) {
+        for (const g of node.gateRefs) this.tickGate(g)
+      } else if (node.type === 'expander' && node.expanderRefs) {
+        for (const e of node.expanderRefs) this.tickExpander(e)
       }
+    })
+  }
 
+  private startMeterLoop(): void {
+    if (this.rafId !== null) return
+    const tick = (): void => {
       this.nodes.forEach((node, id) => {
         node.meters.forEach((analyser, idx) => {
           // Skip the RMS work entirely when nothing is displaying this meter.
@@ -404,6 +431,13 @@ class AudioEngine implements AudioBackend {
       this.rafId = requestAnimationFrame(tick)
     }
     this.rafId = requestAnimationFrame(tick)
+  }
+
+  private stopMeterLoop(): void {
+    if (this.rafId !== null) {
+      cancelAnimationFrame(this.rafId)
+      this.rafId = null
+    }
   }
 
   private tickGate(g: GateChannel): void {

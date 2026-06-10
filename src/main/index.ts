@@ -9,6 +9,14 @@ let pendingCaptureSourceId: string | null = null
 // ── Tray / background ───────────────────────────────────────────────────────
 // The app is a background audio router: minimize and close both hide it to the
 // system tray (it keeps routing audio); it only really quits via the tray menu.
+//
+// RAM saving: on the native engine the audio graph lives in THIS process, so the
+// hidden renderer window is dead weight (~150-250 MB). After a grace period in
+// the tray the window is destroyed outright and recreated from persisted state on
+// the next tray click — the engine ops are replay-idempotent, so the rebuild
+// reattaches to the live graph without an audio gap. Gated off whenever the
+// renderer is load-bearing: Web Audio engine (the renderer IS the engine), or a
+// renderer PCM bridge is active (file player / app capture / recording).
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let appIcon: Electron.NativeImage | null = null
@@ -17,10 +25,59 @@ let isQuitting = false
 // tray or create a tray icon, so Playwright's app.close() exits cleanly.
 const E2E = process.env.AUDIO_NODES_E2E === '1'
 
+// Reported by the renderer (preload `reportBackgroundState`). The default is the
+// safe one: never destroy until the renderer has said who is in charge of audio.
+let bgState: { engine: string; busy: boolean } = { engine: 'unknown', busy: true }
+const DESTROY_GRACE_MS = 45_000
+let destroyTimer: NodeJS.Timeout | null = null
+// Window geometry carried across a destroy/recreate cycle.
+let savedBounds: Electron.Rectangle | null = null
+let savedMaximized = false
+
+function canShedRenderer(): boolean {
+  return bgState.engine === 'native' && !bgState.busy
+}
+
+function scheduleDestroy(): void {
+  cancelDestroy()
+  if (E2E || isQuitting) return
+  destroyTimer = setTimeout(maybeDestroyWindow, DESTROY_GRACE_MS)
+}
+
+function cancelDestroy(): void {
+  if (destroyTimer) {
+    clearTimeout(destroyTimer)
+    destroyTimer = null
+  }
+}
+
+function maybeDestroyWindow(): void {
+  destroyTimer = null
+  const win = mainWindow
+  if (E2E || isQuitting || !win || win.isDestroyed() || win.isVisible()) return
+  if (!canShedRenderer()) return
+  savedBounds = win.getNormalBounds()
+  savedMaximized = win.isMaximized()
+  mainWindow = null
+  // destroy() skips the close-to-tray trap (no `close` event). `window-all-closed`
+  // keeps the app alive because isQuitting is false.
+  win.destroy()
+}
+
+/** Hide to the tray; throttle the renderer first when it isn't load-bearing for
+ *  audio. Sequenced strictly before hide() — toggling throttling while already
+ *  hidden desyncs Chromium's visibility state (electron#50250). */
+function hideToTray(win: BrowserWindow): void {
+  if (canShedRenderer()) win.webContents.setBackgroundThrottling(true)
+  win.hide()
+}
+
 function showMainWindow(): void {
   if (!mainWindow) { createWindow(); return }
   if (mainWindow.isMinimized()) mainWindow.restore()
   mainWindow.show()
+  // Restore full timer/rAF resolution (strictly after show — see hideToTray).
+  mainWindow.webContents.setBackgroundThrottling(false)
   mainWindow.focus()
 }
 
@@ -70,7 +127,7 @@ interface NativeAudioEngineInstance {
   latencyMs(): number
   startRecording(id: string): boolean
   stopRecording(id: string): string | null
-  pushCapture(id: string, samples: Float32Array): void
+  pushCapture(id: string, samples: Float32Array, sampleRate: number): void
 }
 interface NativeAudioModule {
   version(): string
@@ -107,9 +164,14 @@ async function getNativeEngine(): Promise<NativeAudioEngineInstance | null> {
 }
 
 function createWindow(): void {
+  // A recreated window must re-earn destroy eligibility: reset to the safe
+  // default until the new renderer reports its background state.
+  bgState = { engine: 'unknown', busy: true }
   const win = new BrowserWindow({
-    width: 1400,
-    height: 900,
+    width: savedBounds?.width ?? 1400,
+    height: savedBounds?.height ?? 900,
+    x: savedBounds?.x,
+    y: savedBounds?.y,
     minWidth: 900,
     minHeight: 600,
     show: false,
@@ -134,15 +196,21 @@ function createWindow(): void {
   mainWindow = win
 
   win.on('ready-to-show', () => {
+    if (savedMaximized) win.maximize()
     win.show()
   })
+
+  // Arm the destroy grace timer whenever the window goes to the tray; any show
+  // (tray click, app activate) disarms it.
+  win.on('hide', scheduleDestroy)
+  win.on('show', cancelDestroy)
 
   // Close + minimize hide to the tray instead of quitting / going to the taskbar,
   // so the app keeps routing audio in the background. Real quit sets isQuitting.
   win.on('close', (e) => {
     if (!isQuitting && !E2E) {
       e.preventDefault()
-      win.hide()
+      hideToTray(win)
     }
   })
 
@@ -161,14 +229,22 @@ function createWindow(): void {
 app.whenReady().then(() => {
   electronApp.setAppUserModelId('com.audionodes')
   appIcon = nativeImage.createFromDataURL(TRAY_ICON_DATA_URL)
-  app.on('before-quit', () => { isQuitting = true })
+  app.on('before-quit', () => { isQuitting = true; cancelDestroy() })
+
+  // Renderer background-state reports (see preload `reportBackgroundState`).
+  ipcMain.on('renderer:bg-state', (_e, state: { engine: string; busy: boolean }) => {
+    bgState = state
+  })
 
   app.on('browser-window-created', (_, window) => {
     optimizer.watchWindowShortcuts(window)
   })
 
   // Window controls (frameless titlebar). Minimize hides to the tray.
-  ipcMain.on('window-minimize', (e) => BrowserWindow.fromWebContents(e.sender)?.hide())
+  ipcMain.on('window-minimize', (e) => {
+    const w = BrowserWindow.fromWebContents(e.sender)
+    if (w) hideToTray(w)
+  })
   ipcMain.on('window-maximize', (e) => {
     const w = BrowserWindow.fromWebContents(e.sender)
     if (w?.isMaximized()) w.unmaximize()
@@ -234,8 +310,8 @@ app.whenReady().then(() => {
   ipcMain.on('audio:start-recording', (_e, id: string) =>
     withEngine((e) => e.startRecording(id)))
   // High-rate: PCM blocks captured in the renderer (getDisplayMedia) → engine ring.
-  ipcMain.on('audio:push-capture', (_e, id: string, samples: Float32Array) =>
-    withEngine((e) => e.pushCapture(id, samples)))
+  ipcMain.on('audio:push-capture', (_e, id: string, samples: Float32Array, sampleRate: number) =>
+    withEngine((e) => e.pushCapture(id, samples, sampleRate)))
   // Stop → the engine writes a temp WAV; read it back as bytes for the renderer
   // (so the same download/playback path as Web Audio works), then delete it.
   ipcMain.handle('audio:stop-recording', async (_e, id: string) => {

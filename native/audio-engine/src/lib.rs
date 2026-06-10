@@ -208,10 +208,11 @@ impl NativeAudioEngine {
         self.engine.stop_recording(&id)
     }
 
-    /// Feed captured PCM (interleaved stereo f32) into an application/loopback node.
+    /// Feed captured PCM (interleaved stereo f32 at `sample_rate` Hz) into an
+    /// application/loopback node. The engine resamples to the master rate if needed.
     #[napi]
-    pub fn push_capture(&self, id: String, samples: Float32Array) {
-        self.engine.push_capture(&id, samples.as_ref());
+    pub fn push_capture(&self, id: String, samples: Float32Array, sample_rate: f64) {
+        self.engine.push_capture(&id, samples.as_ref(), sample_rate);
     }
 
     // ── Device enumeration ─────────────────────────────────────────────────

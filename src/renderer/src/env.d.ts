@@ -32,6 +32,7 @@ interface Window {
     windowMinimize: () => void
     windowMaximize: () => void
     windowClose: () => void
+    reportBackgroundState: (state: { engine: string; busy: boolean }) => void
     listWindowSources: () => Promise<WindowSource[]>
     findSourceByName: (name: string) => Promise<{ id: string; name: string } | null>
     armCaptureSource: (sourceId: string) => Promise<void>
@@ -53,7 +54,7 @@ interface Window {
       latency: () => Promise<number>
       startRecording: (id: string) => void
       stopRecording: (id: string) => Promise<{ bytes: Uint8Array; ext: string; mime: string } | null>
-      pushCapture: (id: string, samples: Float32Array) => void
+      pushCapture: (id: string, samples: Float32Array, sampleRate: number) => void
     }
   }
 }
