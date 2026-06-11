@@ -50,7 +50,9 @@ export interface AudioBackend {
 
   // ── Application capture ───────────────────────────────────────────────────
   createApplicationNode(id: string, sourceId: string, sourceName: string): Promise<void>
-  armApplicationCapture(id: string, sourceId: string, sourceName: string): Promise<void>
+  /** `takeover` (native, `pid:` sources only): park the app's own output on a
+   *  virtual sink while captured so it isn't heard twice. Default true. */
+  armApplicationCapture(id: string, sourceId: string, sourceName: string, takeover?: boolean): Promise<void>
   isApplicationActive(id: string): boolean
 
   // ── Output device ─────────────────────────────────────────────────────────

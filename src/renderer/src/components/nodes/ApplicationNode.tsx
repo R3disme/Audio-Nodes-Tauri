@@ -1,12 +1,27 @@
-import { useState, useSyncExternalStore } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import { type NodeProps } from '@xyflow/react'
 import { NodeBase } from './NodeBase'
 import { AudioHandle } from './AudioHandle'
 import { StereoVUMeter } from '../VUMeter'
 import { AppPicker } from '../AppPicker'
 import { useAudioStore, type ApplicationNodeData } from '@renderer/store/audioStore'
-import { audioEngine } from '@renderer/audio/backend'
+import { audioEngine, getActiveEngineKind } from '@renderer/audio/backend'
 import { AppWindow, RefreshCw, AlertCircle } from 'lucide-react'
+
+/** Name of the virtual sink takeover would park apps on (null = unavailable,
+ *  undefined = still loading). Probed once per mount, native engine only. */
+function useTakeoverDevice(enabled: boolean): string | null | undefined {
+  const [device, setDevice] = useState<string | null | undefined>(undefined)
+  useEffect(() => {
+    if (!enabled) return
+    let alive = true
+    window.api.audio.takeoverDevice()
+      .then(d => { if (alive) setDevice(d) })
+      .catch(() => { if (alive) setDevice(null) })
+    return () => { alive = false }
+  }, [enabled])
+  return device
+}
 
 function useAppActive(id: string): boolean {
   return useSyncExternalStore(
@@ -21,13 +36,40 @@ export function ApplicationNode({ id, data, selected }: NodeProps): JSX.Element 
   const updateNodeData = useAudioStore(s => s.updateNodeData)
   const [pickerOpen, setPickerOpen] = useState(false)
   const active = useAppActive(id)
+  const takeover = d.takeover !== false
+  // Exclusive mode only exists for native per-process captures of a single app.
+  const isPidSource = !!d.sourceId?.startsWith('pid:')
+  const isSingleApp = isPidSource && !!d.sourceId.split(':')[2]
+  const showTakeover = getActiveEngineKind() === 'native' && isSingleApp
+  const parkDevice = useTakeoverDevice(showTakeover && takeover)
 
   const handlePick = async (sourceId: string, sourceName: string): Promise<void> => {
     updateNodeData(id, { sourceId, sourceName })
-    await audioEngine.armApplicationCapture(id, sourceId, sourceName)
+    await audioEngine.armApplicationCapture(id, sourceId, sourceName, takeover)
+  }
+
+  const toggleTakeover = async (): Promise<void> => {
+    const next = !takeover
+    updateNodeData(id, { takeover: next })
+    // Re-arm so the engine applies/clears the endpoint parking immediately.
+    if (d.sourceId && active) await audioEngine.armApplicationCapture(id, d.sourceId, d.sourceName, next)
   }
 
   const reconnect = async (): Promise<void> => {
+    // Native per-process capture: pids churn when the app restarts — re-resolve
+    // the saved exe against the live audio-session list.
+    if (d.sourceId?.startsWith('pid:')) {
+      const exe = d.sourceId.split(':')[2] || ''
+      if (!exe) return // pid 0 (system audio) never goes stale
+      const apps = await window.api.audio.listAudioApps().catch(() => [] as AudioAppInfo[])
+      const m = apps.find(a => a.exe.toLowerCase() === exe.toLowerCase())
+      if (m) {
+        const sid = `pid:${m.pid}:${m.exe}`
+        updateNodeData(id, { sourceId: sid })
+        await audioEngine.armApplicationCapture(id, sid, d.sourceName, takeover)
+      }
+      return
+    }
     if (!d.sourceName) return setPickerOpen(true)
     const match = await window.api.findSourceByName(d.sourceName)
     if (match) {
@@ -69,6 +111,31 @@ export function ApplicationNode({ id, data, selected }: NodeProps): JSX.Element 
             </div>
             <StereoVUMeter nodeId={id} height={28} />
           </div>
+
+          {showTakeover && (
+            <label
+              className="flex items-center gap-1.5 nodrag cursor-pointer select-none"
+              title="Route the app's own output away from your speakers while it's captured, so you don't hear it twice. Needs a virtual cable to park the app on."
+            >
+              <input
+                type="checkbox"
+                checked={takeover}
+                onChange={() => void toggleTakeover()}
+                className="w-3 h-3 accent-orange-400 cursor-pointer"
+              />
+              <span className="text-[9px] text-zinc-400">Exclusive (silence app's own output)</span>
+            </label>
+          )}
+
+          {showTakeover && takeover && parkDevice === null && (
+            <div className="flex items-start gap-1.5 px-2 py-1 bg-amber-900/20 border border-amber-700/30 rounded">
+              <AlertCircle size={10} className="text-amber-400 shrink-0 mt-0.5" />
+              <span className="text-amber-300 text-[9px] flex-1">
+                No virtual cable to park the app on — you'll hear it twice. Build the Audio
+                Nodes Virtual Cable or install VB-Cable.
+              </span>
+            </div>
+          )}
 
           {d.sourceName && !active && (
             <div className="flex items-center gap-1.5 px-2 py-1 bg-amber-900/20 border border-amber-700/30 rounded">

@@ -20,6 +20,13 @@ interface NativeEngineInfo {
   audioReady: boolean
 }
 
+interface AudioAppInfo {
+  pid: number
+  name: string
+  exe: string
+  active: boolean
+}
+
 interface Window {
   electron: {
     ipcRenderer: {
@@ -33,6 +40,12 @@ interface Window {
     windowMaximize: () => void
     windowClose: () => void
     reportBackgroundState: (state: { engine: string; busy: boolean }) => void
+    driver: {
+      status: () => Promise<{ available: boolean; building: boolean }>
+      build: () => Promise<{ code: number; error?: string }>
+      install: () => Promise<{ ok: boolean; error?: string }>
+      onLog: (cb: (line: string) => void) => () => void
+    }
     listWindowSources: () => Promise<WindowSource[]>
     findSourceByName: (name: string) => Promise<{ id: string; name: string } | null>
     armCaptureSource: (sourceId: string) => Promise<void>
@@ -55,6 +68,9 @@ interface Window {
       startRecording: (id: string) => void
       stopRecording: (id: string) => Promise<{ bytes: Uint8Array; ext: string; mime: string } | null>
       pushCapture: (id: string, samples: Float32Array, sampleRate: number) => void
+      listAudioApps: () => Promise<AudioAppInfo[]>
+      setAppProcess: (id: string, pid: number, takeover: boolean) => void
+      takeoverDevice: () => Promise<string | null>
     }
   }
 }

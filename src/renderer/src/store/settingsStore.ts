@@ -29,6 +29,8 @@ interface PersistedSettings {
   latencyMode: LatencyMode
   /** Output device backend (native engine). Defaults to 'shared'. */
   deviceMode: DeviceMode
+  /** Application-picker auto-refresh interval in seconds (0 = off). Default 5. */
+  appRefreshSeconds: number
 }
 
 function load(): PersistedSettings {
@@ -42,11 +44,12 @@ function load(): PersistedSettings {
         nodeScale: p.nodeScale ?? 1,
         engine: p.engine === 'webaudio' ? 'webaudio' : 'native',
         latencyMode: p.latencyMode === 'low' || p.latencyMode === 'safe' ? p.latencyMode : 'balanced',
-        deviceMode: p.deviceMode === 'lowlatency' || p.deviceMode === 'exclusive' ? p.deviceMode : 'shared'
+        deviceMode: p.deviceMode === 'lowlatency' || p.deviceMode === 'exclusive' ? p.deviceMode : 'shared',
+        appRefreshSeconds: typeof p.appRefreshSeconds === 'number' ? p.appRefreshSeconds : 5
       }
     }
   } catch { /* ignore corrupt settings */ }
-  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1, engine: 'native', latencyMode: 'balanced', deviceMode: 'shared' }
+  return { theme: DEFAULT_THEME, sidebarCollapsed: false, nodeScale: 1, engine: 'native', latencyMode: 'balanced', deviceMode: 'shared', appRefreshSeconds: 5 }
 }
 
 const applyNodeScale = (n: number): void =>
@@ -59,6 +62,7 @@ interface SettingsState {
   engine: EngineKind
   latencyMode: LatencyMode
   deviceMode: DeviceMode
+  appRefreshSeconds: number
   settingsOpen: boolean
 
   setSimpleAccent: (hex: string) => void
@@ -81,6 +85,8 @@ interface SettingsState {
   setLatencyMode: (mode: LatencyMode) => void
   /** Switch output device backend. Persists then reloads so outputs re-open in the new mode. */
   setDeviceMode: (mode: DeviceMode) => void
+  /** Application-picker auto-refresh interval (seconds; 0 disables). */
+  setAppRefreshSeconds: (seconds: number) => void
 }
 
 const initial = load()
@@ -94,9 +100,9 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
     set({ theme })
   }
   const persist = (): void => {
-    const { theme, sidebarCollapsed, nodeScale, engine, latencyMode, deviceMode } = get()
+    const { theme, sidebarCollapsed, nodeScale, engine, latencyMode, deviceMode, appRefreshSeconds } = get()
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify({ theme, sidebarCollapsed, nodeScale, engine, latencyMode, deviceMode }))
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ theme, sidebarCollapsed, nodeScale, engine, latencyMode, deviceMode, appRefreshSeconds }))
     } catch { /* storage full / unavailable — non-fatal */ }
   }
   // Persist after the current synchronous update settles.
@@ -109,6 +115,7 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
     engine: initial.engine,
     latencyMode: initial.latencyMode,
     deviceMode: initial.deviceMode,
+    appRefreshSeconds: initial.appRefreshSeconds,
     settingsOpen: false,
 
     setSimpleAccent: (hex) => {
@@ -202,6 +209,12 @@ export const useSettingsStore = create<SettingsState>((set, get) => {
       // Device mode must be set before outputs open; reload so initAudio replays it
       // to the engine and reopens the output streams in the chosen mode.
       window.location.reload()
+    },
+
+    setAppRefreshSeconds: (seconds) => {
+      const clamped = Math.max(0, Math.min(60, Math.round(seconds)))
+      set({ appRefreshSeconds: clamped })
+      afterChange()
     }
   }
 })

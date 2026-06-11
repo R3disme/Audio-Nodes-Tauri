@@ -16,7 +16,7 @@ interface NodeEntry {
 const NODE_PALETTE: NodeEntry[] = [
   { type: 'input',       label: 'Input',        description: 'Microphone, line-in',     category: 'source' },
   { type: 'fileplayer',  label: 'File Player',  description: 'Play an audio file',      category: 'source' },
-  { type: 'application', label: 'Application',  description: 'Capture window audio',     category: 'source' },
+  { type: 'application', label: 'Application',  description: "Capture one app's audio",  category: 'source' },
   { type: 'volume',      label: 'Volume',       description: 'Gain & mute',              category: 'effect' },
   { type: 'eq',          label: 'Equalizer',    description: '5-band parametric EQ',     category: 'effect' },
   { type: 'compressor',  label: 'Compressor',   description: 'Dynamics control',         category: 'effect' },
@@ -130,7 +130,7 @@ export function Sidebar(): JSX.Element {
 
       <div className="mt-auto p-3" style={{ borderTop: '1px solid var(--c-border)' }}>
         <p className="text-[9px] leading-relaxed" style={{ color: 'var(--c-text-dim)', opacity: 0.8 }}>
-          For per-app isolation, route the app through a virtual audio cable — the built-in Audio Nodes Virtual Cable (native/driver) or VB-Cable — and pick it as an Input device.
+          The Application node captures a single app's audio natively (Native engine). On Web Audio it hears all system audio — route the app through a virtual cable (Audio Nodes Virtual Cable or VB-Cable) for isolation there.
         </p>
       </div>
     </aside>

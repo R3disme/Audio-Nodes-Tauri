@@ -104,12 +104,20 @@ export function deriveSimple(accent: string, base?: Partial<Theme>): Theme {
   }
 }
 
-/** Build a theme (and node palette) from an image, keeping it as the background. */
+/** Largest source image we keep verbatim as the background (animated formats).
+ *  Above this, we fall back to a static downscaled frame so localStorage — which
+ *  also holds all workspaces — stays healthy. */
+const ANIMATED_BG_BUDGET = 3_000_000 // ~3 MB of base64
+
+/** Build a theme (and node palette) from an image, keeping it as the background.
+ *  Any browser-decodable format works (png/jpg/webp/gif/bmp/avif/…). The palette
+ *  is sampled from a downscaled static frame, but **animated GIF/WebP keep their
+ *  original data URL** as the background (within a size budget) so they animate
+ *  on the canvas instead of being flattened to a still JPEG. */
 export async function themeFromImage(dataUrl: string): Promise<Theme> {
-  // Shrink first so the image both samples fast and fits localStorage as the
-  // persisted background.
-  const img = await downscaleDataUrl(dataUrl)
-  const palette = await paletteFromImage(img, NODE_TYPE_ORDER.length)
+  // Shrink first so the image samples fast (one frame; fine for palette extraction).
+  const still = await downscaleDataUrl(dataUrl)
+  const palette = await paletteFromImage(still, NODE_TYPE_ORDER.length)
   const accent = [...palette].sort((a, b) => vibrancy(b) - vibrancy(a))[0] ?? DEFAULT_THEME.accent
 
   const chrome = deriveSimple(accent)
@@ -118,11 +126,16 @@ export async function themeFromImage(dataUrl: string): Promise<Theme> {
     nodes[type] = palette.length ? palette[i % palette.length] : chrome.nodes[type]
   })
 
+  // GIF/WebP can be animated; the JPEG re-encode in downscaleDataUrl would drop
+  // the animation, so keep the original when it's small enough to persist.
+  const animatedCapable = /^data:image\/(gif|webp)/i.test(dataUrl)
+  const background = animatedCapable && dataUrl.length <= ANIMATED_BG_BUDGET ? dataUrl : still
+
   return {
     ...chrome,
     mode: 'picture',
     nodes,
-    backgroundImage: img,
+    backgroundImage: background,
     backgroundImageEnabled: true,
     backgroundImageOpacity: 0.32
   }

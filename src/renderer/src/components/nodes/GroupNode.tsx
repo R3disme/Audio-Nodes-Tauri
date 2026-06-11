@@ -1,4 +1,4 @@
-import { type NodeProps } from '@xyflow/react'
+import { type NodeProps, Handle, Position } from '@xyflow/react'
 import { ChevronDown, ChevronRight, Ungroup } from 'lucide-react'
 import { useAudioStore } from '@renderer/store/audioStore'
 
@@ -69,6 +69,24 @@ export function GroupNode({ id, data, selected }: NodeProps): JSX.Element {
           collapsed — expand to edit
         </div>
       )}
+
+      {/* Anchors for collapsed-group connector edges (proxies routed here so
+          connections crossing the group boundary stay visible). Not user-
+          connectable; near-invisible. */}
+      <Handle
+        type="target"
+        id="group-target"
+        position={Position.Left}
+        isConnectable={false}
+        style={{ top: 16, width: 1, height: 1, opacity: 0, border: 'none', minWidth: 0, minHeight: 0 }}
+      />
+      <Handle
+        type="source"
+        id="group-source"
+        position={Position.Right}
+        isConnectable={false}
+        style={{ top: 16, width: 1, height: 1, opacity: 0, border: 'none', minWidth: 0, minHeight: 0 }}
+      />
     </div>
   )
 }

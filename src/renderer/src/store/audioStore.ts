@@ -39,7 +39,7 @@ import {
   type EQBand,
   type AudioNodeType
 } from '@renderer/audio/AudioEngine'
-import { audioEngine, ensureBackendAvailable } from '@renderer/audio/backend'
+import { audioEngine, ensureBackendAvailable, getActiveEngineKind } from '@renderer/audio/backend'
 
 // ── Node data types ───────────────────────────────────────────────────────
 
@@ -58,6 +58,9 @@ export interface InputNodeData extends BaseNodeData {
 export interface ApplicationNodeData extends BaseNodeData {
   sourceId: string
   sourceName: string
+  /** Native per-process capture: park the app's own output while captured so it
+   *  isn't heard twice (needs a virtual cable to park on). Default true. */
+  takeover?: boolean
 }
 
 export interface OutputNodeData extends BaseNodeData {
@@ -245,7 +248,7 @@ function makeNodeSpec(type: string): NodeSpec | null {
     case 'fileplayer':
       return { idPrefix: 'file', data: { label: 'File Player', fileName: '', loop: false, gain: 1, muted: false, channels: 1 } }
     case 'application':
-      return { idPrefix: 'app', data: { label: 'Application', sourceId: '', sourceName: '', channels: 1 } }
+      return { idPrefix: 'app', data: { label: 'Application', sourceId: '', sourceName: '', takeover: true, channels: 1 } }
     case 'output':
       return { idPrefix: 'output', data: { label: 'Output', deviceId: '', deviceName: 'Default', volume: 1, muted: false, channels: 1 } }
     case 'virtual':
@@ -342,13 +345,31 @@ async function rebuildEngineNode(type: string, id: string, data: Record<string, 
       if (data.muted) audioEngine.muteNode(id, true)
       if (data.loop) audioEngine.setFilePlayerLoop(id, true)
       break
-    case 'application':
+    case 'application': {
       await audioEngine.createApplicationNode(id, '', (data.sourceName as string) || '')
-      if (data.sourceName) {
+      const sid = (data.sourceId as string) || ''
+      if (sid.startsWith('pid:')) {
+        // Native per-process capture. Pids churn across restarts, so re-resolve
+        // the saved exe against the live session list (pid 0 = system audio is
+        // stable and re-arms directly). On a Web Audio session a pid source
+        // can't be armed — the user re-picks a window.
+        if (getActiveEngineKind() === 'native') {
+          const takeover = data.takeover !== false
+          const exe = sid.split(':')[2] || ''
+          if (!exe) {
+            await audioEngine.armApplicationCapture(id, 'pid:0:', (data.sourceName as string) || 'System audio', takeover)
+          } else {
+            const apps = await window.api.audio.listAudioApps().catch(() => [] as AudioAppInfo[])
+            const m = apps.find(a => a.exe.toLowerCase() === exe.toLowerCase())
+            if (m) await audioEngine.armApplicationCapture(id, `pid:${m.pid}:${m.exe}`, (data.sourceName as string) || m.name, takeover)
+          }
+        }
+      } else if (data.sourceName) {
         const m = await window.api.findSourceByName(data.sourceName as string)
         if (m) await audioEngine.armApplicationCapture(id, m.id, data.sourceName as string)
       }
       break
+    }
     case 'output':
       audioEngine.createOutputNode(id, 'output')
       audioEngine.setGain(id, num(data.volume, 1))
@@ -460,8 +481,12 @@ function edgeStrokeFor(srcNode?: { type?: string; data?: Record<string, unknown>
  * so the flag stays in sync with the topology. Cheap (graphs are small).
  */
 function applyCycleStyles(nodes: AudioFlowNode[], edges: AudioFlowEdge[]): AudioFlowEdge[] {
-  const cyclic = findCyclicEdgeIds(edges)
+  // Proxy edges (collapsed-group connectors) aren't part of the audio graph — they
+  // keep their own dashed style and never participate in cycle detection.
+  const real = edges.filter(e => !isProxyEdge(e))
+  const cyclic = findCyclicEdgeIds(real)
   return edges.map(e => {
+    if (isProxyEdge(e)) return e
     const isCyclic = cyclic.has(e.id)
     const base = edgeStrokeFor(nodes.find(n => n.id === e.source))
     return {
@@ -475,6 +500,77 @@ function applyCycleStyles(nodes: AudioFlowNode[], edges: AudioFlowEdge[]): Audio
       }
     } as AudioFlowEdge
   })
+}
+
+// ── Collapsed-group edge proxies ─────────────────────────────────────────────
+// A collapsed group hides its members, so React Flow can't draw the real edges
+// that touch them. To keep connections that cross the group boundary *visible*,
+// we hide those real edges and add display-only **proxy** edges that anchor the
+// hidden endpoint to the group container's handles. Proxies are marked
+// `data.proxy` and are skipped by the engine, persistence and cycle detection.
+const PROXY_PREFIX = 'proxy-'
+
+export function isProxyEdge(e: AudioFlowEdge): boolean {
+  return e.id.startsWith(PROXY_PREFIX) || !!(e.data as { proxy?: boolean } | undefined)?.proxy
+}
+
+/**
+ * Recompute edge visibility + proxies from the current collapsed-group state.
+ * Strips any existing proxies, hides real edges touching a hidden member, and
+ * adds one proxy per boundary-crossing connection (deduped by endpoint pair).
+ * Pure — returns a new edge array.
+ */
+function recomputeGroupVisibility(nodes: AudioFlowNode[], edges: AudioFlowEdge[]): AudioFlowEdge[] {
+  const collapsed = new Set(
+    nodes.filter(n => n.type === 'subgraph' && (n.data as { collapsed?: boolean } | undefined)?.collapsed).map(n => n.id)
+  )
+  // hidden member id → its collapsed group id
+  const memberGroup = new Map<string, string>()
+  if (collapsed.size > 0) {
+    for (const n of nodes) {
+      if (n.parentId && collapsed.has(n.parentId)) memberGroup.set(n.id, n.parentId)
+    }
+  }
+
+  const real = edges.filter(e => !isProxyEdge(e))
+  if (memberGroup.size === 0) {
+    // Nothing collapsed: just make sure no real edge is left hidden.
+    return real.map(e => (e.hidden ? { ...e, hidden: false } : e))
+  }
+
+  const out: AudioFlowEdge[] = []
+  const seen = new Set<string>()
+  for (const e of real) {
+    const sHidden = memberGroup.has(e.source)
+    const tHidden = memberGroup.has(e.target)
+    if (!sHidden && !tHidden) {
+      out.push(e.hidden ? { ...e, hidden: false } : e)
+      continue
+    }
+    // Touches a hidden member → hide the real edge.
+    out.push({ ...e, hidden: true })
+    // Resolve each hidden endpoint to its (visible) group container.
+    const src = sHidden ? memberGroup.get(e.source)! : e.source
+    const tgt = tHidden ? memberGroup.get(e.target)! : e.target
+    if (src === tgt) continue // fully internal to one collapsed group — no connector
+    const srcHandle = sHidden ? 'group-source' : e.sourceHandle
+    const tgtHandle = tHidden ? 'group-target' : e.targetHandle
+    const key = `${src}:${srcHandle}>${tgt}:${tgtHandle}`
+    if (seen.has(key)) continue // collapse parallel crossings into one connector
+    seen.add(key)
+    out.push({
+      id: PROXY_PREFIX + e.id,
+      source: src,
+      target: tgt,
+      sourceHandle: srcHandle,
+      targetHandle: tgtHandle,
+      data: { proxy: true },
+      selectable: false,
+      deletable: false,
+      style: { stroke: 'var(--c-accent)', strokeWidth: 2, strokeDasharray: '5 4', opacity: 0.85 }
+    } as AudioFlowEdge)
+  }
+  return out
 }
 
 /**
@@ -515,27 +611,27 @@ function deserializeGraph(savedNodes: SavedNode[], savedEdges: SavedEdge[]): { n
   // React Flow requires a parent node to precede its children in the array.
   nodes.sort((a, b) => Number(b.type === 'subgraph') - Number(a.type === 'subgraph'))
 
-  // Re-apply collapsed-group visibility: hide member nodes + edges touching them.
-  const hiddenMembers = new Set<string>()
+  // Re-apply collapsed-group visibility: hide member nodes (their edges + proxy
+  // connectors are recomputed below).
   for (const g of nodes) {
     if (g.type === 'subgraph' && (g.data as Record<string, unknown>)?.collapsed) {
       for (const c of nodes) {
-        if (c.parentId === g.id) { c.hidden = true; hiddenMembers.add(c.id) }
+        if (c.parentId === g.id) c.hidden = true
       }
     }
   }
 
   let edges = savedEdges.map(e => {
     const srcNode = savedNodes.find(n => n.id === e.source)
-    const hidden = hiddenMembers.has(e.source) || hiddenMembers.has(e.target)
     return {
       id: e.id, source: e.source, target: e.target,
       sourceHandle: e.sourceHandle, targetHandle: e.targetHandle,
-      style: { stroke: edgeStrokeFor(srcNode), strokeWidth: 2 },
-      ...(hidden ? { hidden: true } : {})
+      style: { stroke: edgeStrokeFor(srcNode), strokeWidth: 2 }
     }
   }) as AudioFlowEdge[]
   edges = applyCycleStyles(nodes, edges)
+  // Re-create collapsed-group edge visibility + proxy connectors.
+  edges = recomputeGroupVisibility(nodes, edges)
   // Flag any feedback cycles in the loaded graph so they paint as warnings.
   return { nodes, edges }
 }
@@ -556,6 +652,7 @@ async function buildEngine(nodes: AudioFlowNode[], edges: AudioFlowEdge[]): Prom
     }
   }
   for (const e of edges) {
+    if (isProxyEdge(e)) continue // display-only collapsed-group connector
     const src = parseHandle(e.sourceHandle)
     const tgt = parseHandle(e.targetHandle)
     audioEngine.connect(e.source, src?.channel ?? 0, e.target, tgt?.channel ?? 0)
@@ -882,7 +979,6 @@ export const useAudioStore = create<AudioStore>((set, get) => {
         if (!group) return {}
         const ox = group.position.x
         const oy = group.position.y
-        const memberIds = new Set(s.nodes.filter(n => n.parentId === groupId).map(n => n.id))
         const nodes = s.nodes
           .filter(n => n.id !== groupId)
           .map(n =>
@@ -896,9 +992,9 @@ export const useAudioStore = create<AudioStore>((set, get) => {
                 }
               : n
           )
-        const edges = s.edges.map(e =>
-          e.hidden && (memberIds.has(e.source) || memberIds.has(e.target)) ? { ...e, hidden: false } : e
-        )
+        // The group is gone, so recompute proxies/visibility from scratch (drops
+        // this group's connectors and unhides its members' real edges).
+        const edges = recomputeGroupVisibility(nodes, s.edges)
         return { nodes, edges }
       })
     },
@@ -925,9 +1021,9 @@ export const useAudioStore = create<AudioStore>((set, get) => {
           if (memberIds.has(n.id)) return { ...n, hidden: collapsed }
           return n
         })
-        const edges = s.edges.map(e =>
-          memberIds.has(e.source) || memberIds.has(e.target) ? { ...e, hidden: collapsed } : e
-        )
+        // Hide real edges touching members + (when collapsing) add boundary
+        // connectors so connections leaving the group stay visible.
+        const edges = recomputeGroupVisibility(nodes, s.edges)
         return { nodes, edges }
       })
     },

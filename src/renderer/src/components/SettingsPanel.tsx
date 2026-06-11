@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ChangeEvent } from 'react'
-import { X, Palette, Sliders, Image as ImageIcon, RotateCcw, Paintbrush, AudioLines, Gauge } from 'lucide-react'
+import { X, Palette, Sliders, Image as ImageIcon, RotateCcw, Paintbrush, AudioLines, Gauge, Cable, Hammer, Download } from 'lucide-react'
 import { useSettingsStore, type LatencyMode } from '@renderer/store/settingsStore'
 import { audioEngine } from '@renderer/audio/backend'
 import { CORE_TOKENS, type Theme, type ThemeMode } from '@renderer/lib/theme'
@@ -7,7 +7,7 @@ import { NODE_TYPE_ORDER } from '@renderer/lib/nodeColors'
 
 const ACCENT_PRESETS = ['#f0a020', '#22c55e', '#3b82f6', '#a855f7', '#ec4899', '#ef4444', '#14b8a6', '#eab308']
 
-type Section = 'appearance' | 'audio'
+type Section = 'appearance' | 'audio' | 'driver'
 
 const LATENCY_MODES: { id: LatencyMode; label: string; hint: string }[] = [
   { id: 'low', label: 'Low', hint: 'Smallest cushion — lowest latency, may glitch on busy systems' },
@@ -90,11 +90,14 @@ export function SettingsPanel(): JSX.Element | null {
         <div className="flex items-center gap-1 px-4 py-2" style={{ borderBottom: '1px solid var(--c-border)' }}>
           <TabButton active={section === 'appearance'} onClick={() => setSection('appearance')} icon={<Paintbrush size={12} />}>Appearance</TabButton>
           <TabButton active={section === 'audio'} onClick={() => setSection('audio')} icon={<AudioLines size={12} />}>Audio</TabButton>
+          <TabButton active={section === 'driver'} onClick={() => setSection('driver')} icon={<Cable size={12} />}>Driver</TabButton>
         </div>
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4">
-          {section === 'appearance' ? <AppearanceSection /> : <AudioSection />}
+          {section === 'appearance' && <AppearanceSection />}
+          {section === 'audio' && <AudioSection />}
+          {section === 'driver' && <DriverSection />}
         </div>
       </div>
     </div>
@@ -228,6 +231,8 @@ function AudioSection(): JSX.Element {
   const setLatencyMode = useSettingsStore(s => s.setLatencyMode)
   const deviceMode = useSettingsStore(s => s.deviceMode)
   const setDeviceMode = useSettingsStore(s => s.setDeviceMode)
+  const appRefreshSeconds = useSettingsStore(s => s.appRefreshSeconds)
+  const setAppRefreshSeconds = useSettingsStore(s => s.setAppRefreshSeconds)
   const native = engine === 'native'
 
   // Live latency readout (same poll cadence as the toolbar).
@@ -336,6 +341,104 @@ function AudioSection(): JSX.Element {
               ? 'WASAPI IAudioClient3 shared low-latency, default endpoint only. Only lower if your device exposes a small shared period (most built-in audio doesn’t). Reloads on change; falls back to shared.'
               : 'Standard shared-mode output via cpal. Most compatible.'}
           </p>
+        </div>
+      )}
+
+      {/* Application-picker auto-refresh */}
+      <div>
+        <div className="text-[10px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--c-text-dim)' }}>Application picker</div>
+        <label className="flex items-center gap-3 text-[11px]" style={{ color: 'var(--c-text-dim)' }}>
+          <span className="shrink-0">Auto-refresh</span>
+          <input
+            type="range" min={0} max={30} step={1} value={appRefreshSeconds}
+            onChange={e => setAppRefreshSeconds(parseInt(e.target.value, 10))}
+            className="flex-1"
+          />
+          <span className="font-mono w-16 text-right" style={{ color: 'var(--c-text)' }}>
+            {appRefreshSeconds === 0 ? 'off' : `${appRefreshSeconds}s`}
+          </span>
+        </label>
+        <p className="text-[10px] mt-2 leading-snug" style={{ color: 'var(--c-text-dim)' }}>
+          How often the Application capture picker re-scans for running apps, so one that opens or starts playing shows up on its own.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function DriverSection(): JSX.Element {
+  const [available, setAvailable] = useState<boolean | null>(null)
+  const [building, setBuilding] = useState(false)
+  const [log, setLog] = useState<string[]>([])
+  const logRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    void window.api.driver.status().then(s => { setAvailable(s.available); setBuilding(s.building) })
+    // Stream build output into the log view.
+    return window.api.driver.onLog(line => setLog(prev => [...prev.slice(-400), line]))
+  }, [])
+
+  useEffect(() => {
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
+  }, [log])
+
+  const build = async (): Promise<void> => {
+    setBuilding(true)
+    setLog([])
+    try { await window.api.driver.build() } finally { setBuilding(false) }
+  }
+
+  const install = async (): Promise<void> => {
+    const r = await window.api.driver.install()
+    if (!r.ok) setLog(prev => [...prev, `! ${r.error ?? 'install failed to launch'}`])
+  }
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <div className="text-[10px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--c-text-dim)' }}>Audio Nodes Virtual Cable</div>
+        <p className="text-[11px] leading-snug" style={{ color: 'var(--c-text-dim)' }}>
+          Build the bundled virtual-audio driver so other apps can route audio into and out of Audio Nodes.
+          Building needs <span style={{ color: 'var(--c-text)' }}>Visual Studio 2022 + the Windows Driver Kit</span>;
+          installing a test-signed driver needs Windows <span style={{ color: 'var(--c-text)' }}>test signing</span> enabled
+          (<span className="font-mono">bcdedit /set testsigning on</span>, then reboot). See native/driver/README.md.
+        </p>
+      </div>
+
+      {available === false && (
+        <div className="text-[11px] px-3 py-2 rounded" style={{ background: 'color-mix(in srgb, #ef4444 14%, transparent)', color: 'var(--c-text-dim)' }}>
+          Driver sources not found (native/driver). They ship with the source checkout — run{' '}
+          <span className="font-mono">git submodule update --init --recursive</span>.
+        </div>
+      )}
+
+      <div className="flex items-center gap-2">
+        <button
+          onClick={() => void build()}
+          disabled={building || available === false}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors disabled:opacity-40"
+          style={{ background: 'var(--c-accent)', color: '#0b0b0d' }}
+        >
+          <Hammer size={13} />{building ? 'Building…' : 'Build driver'}
+        </button>
+        <button
+          onClick={() => void install()}
+          disabled={available === false}
+          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-[12px] font-medium transition-colors disabled:opacity-40"
+          style={{ background: 'var(--c-surface-2)', color: 'var(--c-text)', border: '1px solid var(--c-border)' }}
+          title="Launches an elevated PowerShell (UAC) to trust the cert + install via pnputil"
+        >
+          <Download size={13} />Install (elevated)…
+        </button>
+      </div>
+
+      {log.length > 0 && (
+        <div
+          ref={logRef}
+          className="font-mono text-[10px] leading-relaxed rounded-md p-2 overflow-y-auto whitespace-pre-wrap"
+          style={{ background: '#0b0b0d', color: '#cbd5e1', maxHeight: 220, border: '1px solid var(--c-border)' }}
+        >
+          {log.map((l, i) => <div key={i}>{l}</div>)}
         </div>
       )}
     </div>

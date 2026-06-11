@@ -149,6 +149,8 @@ mod dsp;
 use dsp::Dsp;
 #[cfg(windows)]
 mod wasapi;
+mod process_loopback;
+pub use process_loopback::{list_audio_apps, takeover_device, AudioApp};
 
 // ── Node kinds the engine understands ───────────────────────────────────────
 
@@ -371,6 +373,11 @@ impl GraphSnapshot {
 enum Command {
     CreateInputStream { id: String, device_id: String },
     CreateOutputStream { id: String, device_id: String },
+    /// Per-process loopback capture into an application node's ring (Windows;
+    /// pid 0 ⇒ system audio = everything except our own process tree).
+    /// `takeover` also parks the app's own render endpoint on a virtual sink
+    /// while captured, so the app isn't heard twice.
+    CreateProcessCapture { id: String, pid: u32, takeover: bool },
     DropStream { id: String },
     Shutdown,
 }
@@ -635,6 +642,49 @@ impl Engine {
             device_id: device_id.to_string(),
         });
         self.recompute();
+    }
+
+    /// Point an application node at a process: `pid > 0` captures that process
+    /// tree only; `pid == 0` captures system audio (everything except Audio
+    /// Nodes); `pid < 0` stops the capture. `takeover` parks the app's own
+    /// render endpoint while captured (see process_loopback.rs). Idempotent
+    /// under replay like the device setters (`"pid:<n>[+t]"` in `open_streams`,
+    /// so toggling takeover reopens the capture).
+    pub fn set_app_process(&self, id: &str, pid: i64, takeover: bool) {
+        if pid < 0 {
+            if let Some(n) = self.shared.nodes.lock().unwrap().get(id) {
+                n.device.lock().unwrap().clear();
+            }
+            let _ = self.tx.send(Command::DropStream { id: id.to_string() });
+            return;
+        }
+        let key = format!("pid:{pid}{}", if takeover { "+t" } else { "" });
+        if let Some(n) = self.shared.nodes.lock().unwrap().get(id) {
+            *n.device.lock().unwrap() = key.clone();
+        }
+        if self.stream_matches(id, &key) {
+            return;
+        }
+        let _ = self.tx.send(Command::DropStream { id: id.to_string() });
+        let _ = self.tx.send(Command::CreateProcessCapture {
+            id: id.to_string(),
+            pid: pid as u32,
+            takeover,
+        });
+    }
+
+    /// Endpoints an Output node currently uses — excluded from takeover parking so
+    /// parked audio can't contaminate a cable the graph carries. Cheap (lock +
+    /// clone); the slow endpoint probe runs off the main thread in the napi layer.
+    pub fn takeover_exclude(&self) -> Vec<String> {
+        self.shared
+            .open_streams
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| s.device_id.clone())
+            .filter(|d| !d.is_empty() && !d.starts_with("pid:"))
+            .collect()
     }
 
     pub fn set_gain(&self, id: &str, gain: f64) {
@@ -1233,6 +1283,8 @@ fn audio_thread(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Command>) {
     let mut wasapi_outs: HashMap<String, wasapi::WasapiOutput> = HashMap::new();
     #[cfg(windows)]
     let mut wasapi_ins: HashMap<String, wasapi::WasapiInput> = HashMap::new();
+    // Per-process loopback captures (application nodes), keyed by node id.
+    let mut proc_caps: HashMap<String, process_loopback::ProcessCapture> = HashMap::new();
 
     while let Ok(cmd) = rx.recv() {
         match cmd {
@@ -1325,8 +1377,28 @@ fn audio_thread(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<Command>) {
                         .insert(id, OpenStream { device_id, mode });
                 }
             }
+            Command::CreateProcessCapture { id, pid, takeover } => {
+                streams.remove(&id);
+                proc_caps.remove(&id);
+                shared.open_streams.lock().unwrap().remove(&id);
+                let mode = shared.device_mode.load(Ordering::Relaxed);
+                match process_loopback::ProcessCapture::start(shared.clone(), id.clone(), pid, takeover) {
+                    Ok(cap) => {
+                        proc_caps.insert(id.clone(), cap);
+                        shared.open_streams.lock().unwrap().insert(
+                            id,
+                            OpenStream {
+                                device_id: format!("pid:{pid}{}", if takeover { "+t" } else { "" }),
+                                mode,
+                            },
+                        );
+                    }
+                    Err(e) => eprintln!("[audio] process loopback (pid {pid}) failed: {e}"),
+                }
+            }
             Command::DropStream { id } => {
                 streams.remove(&id);
+                proc_caps.remove(&id);
                 shared.open_streams.lock().unwrap().remove(&id);
                 #[cfg(windows)]
                 {

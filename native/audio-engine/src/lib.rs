@@ -12,7 +12,8 @@
 // ────────────────────────────────────────────────────────────────────────────
 
 use cpal::traits::{DeviceTrait, HostTrait};
-use napi::bindgen_prelude::Float32Array;
+use napi::bindgen_prelude::{AsyncTask, Float32Array};
+use napi::{Env, Result as NapiResult, Task};
 use napi_derive::napi;
 use std::collections::HashMap;
 
@@ -86,6 +87,53 @@ pub struct AudioDevice {
     pub id: String,
     pub name: String,
     pub is_default: bool,
+}
+
+/// An app with a live audio session (the Windows volume-mixer view) — what the
+/// native Application-node picker lists. `exe` is the stable identity used to
+/// re-resolve `pid` when the app restarts.
+#[napi(object)]
+pub struct AudioAppInfo {
+    pub pid: u32,
+    pub name: String,
+    pub exe: String,
+    pub active: bool,
+}
+
+// ── Off-main-thread tasks ───────────────────────────────────────────────────
+// Enumerating audio sessions + windows and probing endpoints does COM / Win32
+// work that can take tens-to-hundreds of ms. napi methods run on the Electron
+// MAIN thread, so doing this synchronously freezes the window ("not responding")
+// — especially under the picker's auto-refresh. `AsyncTask::compute` runs on the
+// libuv threadpool instead, keeping the UI live; the method returns a Promise.
+
+pub struct ListAppsTask;
+impl Task for ListAppsTask {
+    type Output = Vec<engine::AudioApp>;
+    type JsValue = Vec<AudioAppInfo>;
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        Ok(engine::list_audio_apps())
+    }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output
+            .into_iter()
+            .map(|a| AudioAppInfo { pid: a.pid, name: a.name, exe: a.exe, active: a.active })
+            .collect())
+    }
+}
+
+pub struct TakeoverDeviceTask {
+    exclude: Vec<String>,
+}
+impl Task for TakeoverDeviceTask {
+    type Output = Option<String>;
+    type JsValue = Option<String>;
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        Ok(engine::takeover_device(std::mem::take(&mut self.exclude)))
+    }
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
 }
 
 /// Handle to the native audio engine.
@@ -213,6 +261,32 @@ impl NativeAudioEngine {
     #[napi]
     pub fn push_capture(&self, id: String, samples: Float32Array, sample_rate: f64) {
         self.engine.push_capture(&id, samples.as_ref(), sample_rate);
+    }
+
+    /// Apps with audio sessions or visible windows on the default render device —
+    /// includes minimized apps and apps not yet playing, named by executable (not
+    /// window title). Runs off the main thread (returns a Promise) so the heavy
+    /// COM/Win32 enumeration never freezes the UI.
+    #[napi(ts_return_type = "Promise<AudioAppInfo[]>")]
+    pub fn list_audio_apps(&self) -> AsyncTask<ListAppsTask> {
+        AsyncTask::new(ListAppsTask)
+    }
+
+    /// Per-process capture for an application node: `pid > 0` = that process
+    /// tree only; `0` = system audio (everything except Audio Nodes); `< 0` =
+    /// stop capturing. `takeover` parks the app's own output on a virtual sink
+    /// while captured so it isn't heard twice (best-effort; needs a cable).
+    #[napi]
+    pub fn set_app_process(&self, id: String, pid: i64, takeover: bool) {
+        self.engine.set_app_process(&id, pid, takeover);
+    }
+
+    /// Friendly name of the virtual sink takeover would park apps on, or null
+    /// when takeover is unavailable (no virtual cable installed). Off the main
+    /// thread (Promise) — endpoint enumeration is COM work.
+    #[napi(ts_return_type = "Promise<string | null>")]
+    pub fn takeover_device(&self) -> AsyncTask<TakeoverDeviceTask> {
+        AsyncTask::new(TakeoverDeviceTask { exclude: self.engine.takeover_exclude() })
     }
 
     // ── Device enumeration ─────────────────────────────────────────────────

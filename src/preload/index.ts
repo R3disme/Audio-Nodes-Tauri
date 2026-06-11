@@ -21,6 +21,13 @@ export interface NativeEngineInfo {
   audioReady: boolean
 }
 
+export interface AudioAppInfo {
+  pid: number
+  name: string
+  exe: string
+  active: boolean
+}
+
 const api = {
   windowMinimize: () => ipcRenderer.send('window-minimize'),
   windowMaximize: () => ipcRenderer.send('window-maximize'),
@@ -31,6 +38,19 @@ const api = {
   // if the hidden window can be destroyed in the tray (RAM saving) or only hidden.
   reportBackgroundState: (state: { engine: string; busy: boolean }): void =>
     ipcRenderer.send('renderer:bg-state', state),
+
+  // Virtual-cable driver build/install (native/driver). `onLog` streams build
+  // output; the returned function unsubscribes.
+  driver: {
+    status: (): Promise<{ available: boolean; building: boolean }> => ipcRenderer.invoke('driver:status'),
+    build: (): Promise<{ code: number; error?: string }> => ipcRenderer.invoke('driver:build'),
+    install: (): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('driver:install'),
+    onLog: (cb: (line: string) => void): (() => void) => {
+      const handler = (_e: unknown, line: string): void => cb(line)
+      ipcRenderer.on('driver:log', handler)
+      return () => ipcRenderer.removeListener('driver:log', handler)
+    }
+  },
 
   listWindowSources: (): Promise<WindowSource[]> =>
     ipcRenderer.invoke('list-window-sources'),
@@ -68,7 +88,13 @@ const api = {
     stopRecording: (id: string): Promise<{ bytes: Uint8Array; ext: string; mime: string } | null> =>
       ipcRenderer.invoke('audio:stop-recording', id),
     pushCapture: (id: string, samples: Float32Array, sampleRate: number): void =>
-      ipcRenderer.send('audio:push-capture', id, samples, sampleRate)
+      ipcRenderer.send('audio:push-capture', id, samples, sampleRate),
+    // Per-process application capture (native engine). `takeover` parks the
+    // app's own output on a virtual sink while captured (no duplicate audio).
+    listAudioApps: (): Promise<AudioAppInfo[]> => ipcRenderer.invoke('audio:list-apps'),
+    setAppProcess: (id: string, pid: number, takeover: boolean): void =>
+      ipcRenderer.send('audio:set-app-process', id, pid, takeover),
+    takeoverDevice: (): Promise<string | null> => ipcRenderer.invoke('audio:takeover-device')
   }
 }
 

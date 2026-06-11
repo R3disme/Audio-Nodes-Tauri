@@ -74,13 +74,17 @@ export function serializeNodes(nodes: AudioFlowNode[]): SavedNode[] {
 }
 
 export function serializeEdges(edges: AudioFlowEdge[]): SavedEdge[] {
-  return edges.map(e => ({
-    id: e.id,
-    source: e.source,
-    target: e.target,
-    sourceHandle: e.sourceHandle,
-    targetHandle: e.targetHandle
-  }))
+  // Skip display-only collapsed-group proxy connectors — they're regenerated from
+  // group state on load, and aren't part of the audio graph.
+  return edges
+    .filter(e => !e.id.startsWith('proxy-') && !(e.data as { proxy?: boolean } | undefined)?.proxy)
+    .map(e => ({
+      id: e.id,
+      source: e.source,
+      target: e.target,
+      sourceHandle: e.sourceHandle,
+      targetHandle: e.targetHandle
+    }))
 }
 
 /** Build a plain serializable snapshot of a single graph. */

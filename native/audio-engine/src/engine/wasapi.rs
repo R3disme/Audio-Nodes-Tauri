@@ -51,10 +51,10 @@ const WAVE_FORMAT_EXTENSIBLE: u16 = 0xFFFE;
 /// the scheduling boost pro-audio apps use so the event-driven loops keep their
 /// deadlines under CPU load. Best-effort: on failure (e.g. MMCSS disabled) it logs
 /// and the thread runs unboosted. Reverts on drop.
-struct MmcssGuard(Option<HANDLE>);
+pub(super) struct MmcssGuard(Option<HANDLE>);
 
 impl MmcssGuard {
-    fn register() -> MmcssGuard {
+    pub(super) fn register() -> MmcssGuard {
         let mut task_index = 0u32;
         match unsafe { AvSetMmThreadCharacteristicsW(w!("Pro Audio"), &mut task_index) } {
             Ok(h) => MmcssGuard(Some(h)),

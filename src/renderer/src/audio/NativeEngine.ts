@@ -228,9 +228,11 @@ class NativeEngine implements AudioBackend {
     for (const cb of this.nodeSubs) cb()
   }
 
-  /** True while any renderer-side PCM bridge feeds the native engine (app capture,
-   *  loaded file player) or a recording is in progress — i.e. destroying the
-   *  renderer window would break audio even though the engine lives in main. */
+  /** True while any renderer-side PCM bridge feeds the native engine (legacy
+   *  getDisplayMedia app capture, loaded file player) or a recording is in
+   *  progress — i.e. destroying the renderer window would break audio even
+   *  though the engine lives in main. Per-process captures (`nativePids`) run
+   *  entirely in the Rust engine and deliberately do NOT count. */
   hasActiveBridges(): boolean {
     if (this.appCaptures.size > 0 || this.recording.size > 0) return true
     for (const fp of this.filePlayers.values()) {
@@ -358,17 +360,36 @@ class NativeEngine implements AudioBackend {
     }
   }
 
-  // The renderer captures system audio with getDisplayMedia (proven, same as the
-  // Web Audio engine) and bridges the PCM into the native engine's loopback ring.
+  // Application capture, two paths:
+  //  - `pid:<pid>:<exe>` source ids → **WASAPI process loopback in the Rust
+  //    engine** (only that process tree's audio; pid 0 = system audio minus our
+  //    own output). No renderer PCM bridge — capture survives reloads and the
+  //    tray window-destroy, and never counts as a busy bridge.
+  //  - legacy window source ids (old saved graphs) → the getDisplayMedia bridge
+  //    below, which is inherently all-system-audio (Chromium loopback).
   private appCaptures = new Map<string, { ctx: AudioContext; stream: MediaStream; bridge: CaptureBridge }>()
+  /** Armed per-process captures: node id → its target. `exe` re-resolves the pid
+   *  when the app restarts (pids churn; the exe name is the stable identity). */
+  private nativePids = new Map<string, { pid: number; exe: string; takeover: boolean }>()
+  private appWatchTimer: number | null = null
 
   async createApplicationNode(id: string, _sourceId: string, _sourceName: string): Promise<void> {
     window.api.audio.createNode(id, 'application', 1, '')
   }
 
-  async armApplicationCapture(id: string, sourceId: string, _sourceName: string): Promise<void> {
+  async armApplicationCapture(id: string, sourceId: string, _sourceName: string, takeover = true): Promise<void> {
     if (!sourceId) return
     this.stopAppCapture(id)
+    if (sourceId.startsWith('pid:')) {
+      const [, pidStr, exe = ''] = sourceId.split(':')
+      const pid = Number(pidStr)
+      if (!Number.isFinite(pid) || pid < 0) return
+      window.api.audio.setAppProcess(id, pid, takeover)
+      this.nativePids.set(id, { pid, exe, takeover })
+      this.ensureAppWatch()
+      this.notifyNodeChanges()
+      return
+    }
     try {
       await window.api.armCaptureSource(sourceId)
       const stream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: true })
@@ -388,17 +409,50 @@ class NativeEngine implements AudioBackend {
   }
 
   private stopAppCapture(id: string): void {
+    let changed = false
+    if (this.nativePids.delete(id)) {
+      window.api.audio.setAppProcess(id, -1, false)
+      changed = true
+    }
     const c = this.appCaptures.get(id)
-    if (!c) return
-    c.bridge.stop()
-    c.stream.getTracks().forEach(t => t.stop())
-    void c.ctx.close().catch(() => {})
-    this.appCaptures.delete(id)
-    this.notifyNodeChanges()
+    if (c) {
+      c.bridge.stop()
+      c.stream.getTracks().forEach(t => t.stop())
+      void c.ctx.close().catch(() => {})
+      this.appCaptures.delete(id)
+      changed = true
+    }
+    if (changed) this.notifyNodeChanges()
   }
 
   isApplicationActive(id: string): boolean {
-    return this.appCaptures.has(id)
+    return this.appCaptures.has(id) || this.nativePids.has(id)
+  }
+
+  /** While any per-process capture is armed, re-resolve exe → pid every few
+   *  seconds so an app that restarted (new pid) is recaptured automatically. */
+  private ensureAppWatch(): void {
+    if (this.appWatchTimer !== null) return
+    this.appWatchTimer = window.setInterval(() => void this.refreshAppPids(), 5000)
+  }
+
+  private async refreshAppPids(): Promise<void> {
+    if (this.nativePids.size === 0) {
+      if (this.appWatchTimer !== null) {
+        window.clearInterval(this.appWatchTimer)
+        this.appWatchTimer = null
+      }
+      return
+    }
+    const apps = await window.api.audio.listAudioApps().catch(() => [] as AudioAppInfo[])
+    for (const [id, ent] of this.nativePids) {
+      if (!ent.exe) continue // pid 0 (system audio) never churns
+      const m = apps.find(a => a.exe.toLowerCase() === ent.exe.toLowerCase())
+      if (m && m.pid !== ent.pid) {
+        ent.pid = m.pid
+        window.api.audio.setAppProcess(id, m.pid, ent.takeover)
+      }
+    }
   }
 
   // ── Output ──────────────────────────────────────────────────────────────

@@ -618,7 +618,9 @@ class AudioEngine implements AudioBackend {
   }
 
   /** Attempt to start (or restart) audio capture for an application node. */
-  async armApplicationCapture(id: string, sourceId: string, sourceName: string): Promise<void> {
+  // `_takeover` is native-only (per-process endpoint parking) — meaningless for
+  // Chromium system loopback, accepted to keep the AudioBackend surface aligned.
+  async armApplicationCapture(id: string, sourceId: string, sourceName: string, _takeover?: boolean): Promise<void> {
     const node = this.nodes.get(id)
     if (!node || node.type !== 'application' || !node.appPassThrough) return
     if (!sourceId) return  // No source picked yet

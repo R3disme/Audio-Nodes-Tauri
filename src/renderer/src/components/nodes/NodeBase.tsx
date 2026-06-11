@@ -39,6 +39,9 @@ export function NodeBase({
   // MixerNode also calls this directly for its own input-count changes.)
   const updateNodeInternals = useUpdateNodeInternals()
   const nodeScale = useSettingsStore(s => s.nodeScale)
+  // Per-node recolor is an advanced affordance — only surface the swatch when the
+  // user is in advanced theming, so the default header stays clean.
+  const showColorControl = useSettingsStore(s => s.theme.mode === 'advanced')
   useEffect(() => {
     updateNodeInternals(id)
   }, [id, channelControl?.channels, nodeScale, updateNodeInternals])
@@ -82,22 +85,23 @@ export function NodeBase({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
-          {/* Per-node color: click to recolor, right-click to reset to default.
-              Sized as a comfortable tap target and separated from the action
-              cluster so it isn't accidentally clicked instead of a button. */}
-          <label
-            className="relative w-[18px] h-[18px] rounded-full nodrag cursor-pointer ring-1 ring-black/40 hover:ring-white/60 transition-colors shrink-0"
-            title="Recolor node (right-click to reset)"
-            style={{ background: swatchValue }}
-            onContextMenu={e => { e.preventDefault(); setNodeColor(id, null) }}
-          >
-            <input
-              type="color"
-              value={swatchValue}
-              onChange={e => setNodeColor(id, e.target.value)}
-              className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-            />
-          </label>
+          {/* Per-node color (advanced theming only): click to recolor,
+              right-click to reset. Hidden by default to keep the header clean. */}
+          {showColorControl && (
+            <label
+              className="relative w-[18px] h-[18px] rounded-full nodrag cursor-pointer ring-1 ring-black/40 hover:ring-white/60 transition-colors shrink-0"
+              title="Recolor node (right-click to reset)"
+              style={{ background: swatchValue }}
+              onContextMenu={e => { e.preventDefault(); setNodeColor(id, null) }}
+            >
+              <input
+                type="color"
+                value={swatchValue}
+                onChange={e => setNodeColor(id, e.target.value)}
+                className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
+              />
+            </label>
+          )}
 
           {channelControl && (
             <>

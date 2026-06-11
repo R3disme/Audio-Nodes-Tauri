@@ -83,17 +83,46 @@ loopback — Rust engine Phase 3.)
 
 ## Distribution (shipping to other machines)
 
-Test signing only works on machines with test mode on. To ship to users:
+**Decision (2026‑06): not pursued — users build the driver themselves** (the EV
+cert + Partner Center cost isn't justified right now). This section stays as the
+reference pipeline should that ever change; it is a **money/paperwork problem, not
+a code problem** — the build below is already the exact artifact that would be
+submitted.
 
-1. Get an **EV code‑signing certificate** (~$300/yr) and a **Microsoft Partner
-   Center / Hardware Dev Center** account.
-2. Build the package, make a `.cab`, **EV‑sign** it, and submit it for
-   **attestation signing** — Microsoft returns a countersigned driver that installs
-   on any Windows 10/11 machine with **no test mode**.
-3. Ship via an **elevated installer** (the app currently packages with
-   `electron-vite`; production would add electron‑builder/NSIS + an elevated
-   `pnputil /add-driver … /install` step). Same driver source — only the signing
-   step changes from the test‑signed flow above.
+**The signing landscape (researched 2026‑06; re‑verify before acting):**
+
+- Test signing only works on machines with test mode enabled (`bcdedit
+  /set testsigning on`, reboot, "Test Mode" watermark) — fine for developers,
+  unacceptable for end users.
+- **There is no free route.** Windows 10/11 (Secure Boot) only loads kernel drivers
+  countersigned by Microsoft (**attestation signing** or full WHQL) via the
+  **Partner Center / Hardware Dev Center**, and registering there requires an
+  **EV code‑signing certificate** (~$250–400/yr depending on CA). **Azure Trusted
+  Signing (~$10/mo) explicitly does NOT cover kernel‑mode drivers** and is not
+  accepted for Hardware Program registration.
+- **Upstream doesn't solve it for us either:** `VirtualDrivers/Virtual-Audio-Driver`
+  releases carry a SignPath.io authenticode signature, but that is *not* Microsoft
+  attestation — their own README still requires test mode. So bundling upstream's
+  release buys nothing, and rebranding would invalidate their signature anyway.
+
+**Pipeline once an EV cert + Partner Center account exist:**
+
+1. Register the EV cert with the Partner Center hardware account (one‑time).
+2. `./build.ps1` as today, but **EV‑sign** the `.sys`/`.cat` instead of the test
+   cert, pack `out/` into a `.cab` (`makecab /f`), EV‑sign the cab.
+3. Submit the cab for **attestation signing**; Microsoft returns a countersigned
+   package that installs on any Windows 10/11 x64 machine with **no test mode**.
+   (Attestation covers Win10/11 desktop; Windows Server would need full WHQL/HLK.)
+4. Ship it: publish the signed package as a GitHub release asset, and/or bundle it
+   in a packaged installer (electron‑builder/NSIS) with an elevated
+   `pnputil /add-driver VirtualAudioDriver.inf /install` step. The app already
+   auto‑detects the endpoints, so no app change is needed.
+5. Repeat 2–3 per driver release (each new binary needs its own attestation pass —
+   another reason the submodule stays pinned).
+
+**Until then:** users either build + test‑sign locally (above), or install
+[VB‑Cable](https://vb-audio.com/Cable/) — the app's cable detection covers it out
+of the box.
 
 ## Notes & caveats
 

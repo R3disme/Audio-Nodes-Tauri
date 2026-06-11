@@ -1,6 +1,8 @@
 import { app, shell, BrowserWindow, ipcMain, desktopCapturer, session, Tray, Menu, nativeImage } from 'electron'
 import { join } from 'path'
+import { existsSync } from 'node:fs'
 import { readFile, unlink } from 'node:fs/promises'
+import { spawn } from 'node:child_process'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
 import { TRAY_ICON_DATA_URL } from './trayIcon'
 
@@ -128,6 +130,9 @@ interface NativeAudioEngineInstance {
   startRecording(id: string): boolean
   stopRecording(id: string): string | null
   pushCapture(id: string, samples: Float32Array, sampleRate: number): void
+  listAudioApps(): { pid: number; name: string; exe: string; active: boolean }[]
+  setAppProcess(id: string, pid: number, takeover: boolean): void
+  takeoverDevice(): string | null
 }
 interface NativeAudioModule {
   version(): string
@@ -307,6 +312,19 @@ app.whenReady().then(() => {
     const engine = await getNativeEngine()
     return engine ? engine.latencyMs() : 0
   })
+  // Per-process application capture (Windows process loopback): the app list is
+  // the volume-mixer view (audio sessions — minimized apps included, named by
+  // exe), and capture runs entirely in the Rust engine (no renderer PCM bridge).
+  ipcMain.handle('audio:list-apps', async () => {
+    const engine = await getNativeEngine()
+    return engine ? engine.listAudioApps() : []
+  })
+  ipcMain.on('audio:set-app-process', (_e, id: string, pid: number, takeover: boolean) =>
+    withEngine((e) => e.setAppProcess(id, pid, takeover)))
+  ipcMain.handle('audio:takeover-device', async () => {
+    const engine = await getNativeEngine()
+    return engine ? engine.takeoverDevice() : null
+  })
   ipcMain.on('audio:start-recording', (_e, id: string) =>
     withEngine((e) => e.startRecording(id)))
   // High-rate: PCM blocks captured in the renderer (getDisplayMedia) → engine ring.
@@ -350,6 +368,57 @@ app.whenReady().then(() => {
   ipcMain.on('audio:set-device-mode', (_e, mode: string) =>
     withEngine((e) => e.setDeviceMode(mode)))
   ipcMain.on('audio:destroy-node', (_e, id: string) => withEngine((e) => e.destroyNode(id)))
+
+  // ── Virtual-cable driver build/install ─────────────────────────────────────
+  // Power-user convenience: build (and optionally install) the Audio Nodes
+  // Virtual Cable from native/driver/ without leaving the app. Build needs no
+  // admin; install must be elevated, so it launches a UAC'd PowerShell window.
+  const driverDir = join(app.getAppPath(), 'native', 'driver')
+  const driverScript = (name: string): string => join(driverDir, name)
+  let driverBuilding = false
+
+  ipcMain.handle('driver:status', async () => ({
+    available: existsSync(driverScript('build.ps1')),
+    building: driverBuilding
+  }))
+
+  ipcMain.handle('driver:build', async (e) => {
+    const script = driverScript('build.ps1')
+    if (!existsSync(script)) return { code: -1, error: 'build.ps1 not found (native/driver missing)' }
+    if (driverBuilding) return { code: -1, error: 'a build is already running' }
+    driverBuilding = true
+    const wc = e.sender
+    const emit = (line: string): void => { if (!wc.isDestroyed()) wc.send('driver:log', line) }
+    emit(`> building driver — ${script}`)
+    return await new Promise<{ code: number }>((resolve) => {
+      const child = spawn('powershell.exe',
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script],
+        { cwd: driverDir })
+      const pump = (buf: Buffer): void => buf.toString().split(/\r?\n/).forEach(l => l && emit(l))
+      child.stdout.on('data', pump)
+      child.stderr.on('data', pump)
+      child.on('error', (err) => { emit(`! failed to start PowerShell: ${err.message}`); driverBuilding = false; resolve({ code: -1 }) })
+      child.on('close', (code) => {
+        emit(code === 0 ? '✓ build finished — output in native/driver/out/' : `✗ build exited with code ${code}`)
+        driverBuilding = false
+        resolve({ code: code ?? -1 })
+      })
+    })
+  })
+
+  ipcMain.handle('driver:install', async (e) => {
+    const script = driverScript('install.ps1')
+    if (!existsSync(script)) return { ok: false, error: 'install.ps1 not found' }
+    // install.ps1 self-checks for elevation; launch it in a UAC-elevated console
+    // that stays open so the user can read the result (output can't stream back
+    // across the elevation boundary).
+    const inner = `-NoExit -NoProfile -ExecutionPolicy Bypass -File "${script}"`
+    const cmd = `Start-Process powershell.exe -Verb RunAs -ArgumentList '${inner}'`
+    const child = spawn('powershell.exe', ['-NoProfile', '-Command', cmd], { cwd: driverDir })
+    child.on('error', () => {})
+    e.sender.send('driver:log', '> launching elevated installer (accept the UAC prompt)…')
+    return { ok: true }
+  })
 
   // Set up displayMedia handler. Allows the renderer to call getDisplayMedia
   // with `audio: 'loopback'` even when picking a non-browser window source.

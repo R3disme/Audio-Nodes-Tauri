@@ -31,6 +31,17 @@ windows = { version = "0.54", features = [
   "Win32_Media_Audio",
   "Win32_System_Com",
   "Win32_System_Threading",
+  # `#[implement]`/`#[interface]` for the process-loopback activation handler
+  # and the (undocumented) IAudioPolicyConfigFactory app-takeover interface.
+  "implement",
+  # RoGetActivationFactory (AudioPolicyConfig activation) for app takeover.
+  "Win32_System_WinRT",
+  # PKEY_Device_FriendlyName for picking the takeover parking endpoint.
+  "Win32_Devices_FunctionDiscovery",
+  # IPropertyStore for reading endpoint friendly names.
+  "Win32_UI_Shell_PropertiesSystem",
+  # EnumWindows etc. — list open apps before they create an audio session.
+  "Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]
