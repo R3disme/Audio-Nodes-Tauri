@@ -17,7 +17,7 @@ use napi::{Env, Result as NapiResult, Task};
 use napi_derive::napi;
 use std::collections::HashMap;
 
-mod engine;
+pub mod engine;
 
 /// Semantic version of the native engine crate (mirrors Cargo.toml).
 #[napi]

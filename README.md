@@ -170,18 +170,18 @@ node scripts/screenshot.mjs     # wires a demo graph, writes screenshots/
 
 ## 🛠 Stack
 
-Electron + electron-vite · React 18 + TypeScript (strict) · @xyflow/react (canvas) · Zustand ·
-Web Audio API · Tailwind CSS · (optional) Rust + napi-rs engine · (optional) WDM/PortCls driver
+Tauri + Vite · React 18 + TypeScript (strict) · @xyflow/react (canvas) · Zustand ·
+Web Audio API · Tailwind CSS · Rust audio engine · WDM/PortCls driver
 
 ## 📁 Project layout
 
 ```
+src-tauri/     Tauri shell and Rust commands (window, tray, driver, audio bridge)
 src/
-  main/        Electron main process (window, tray, desktopCapturer, native-engine IPC)
-  preload/     Context-isolated IPC bridge
   renderer/src/
     audio/        AudioEngine (Web Audio) + NativeEngine (Rust IPC) behind an AudioBackend seam
     components/   Toolbar, Sidebar, WorkspaceBar, NodeEditor, SettingsPanel, VU meters, nodes/
+    platform/     Renderer bridge that exposes the legacy window.api surface on top of Tauri
     lib/          color/theme math, node colors, persistence
     store/        Zustand stores (audio graph + workspaces, settings/theme)
 native/

@@ -1,0 +1,33 @@
+{
+  "build": {
+    "beforeDevCommand": "npm run dev:renderer",
+    "beforeBuildCommand": "npm run build:renderer",
+    "devPath": "http://localhost:5173",
+    "distDir": "../dist"
+  },
+  "package": {
+    "productName": "Audio Nodes",
+    "version": "1.0.0"
+  },
+  "tauri": {
+    "bundle": {
+      "active": true,
+      "identifier": "com.audionodes.app",
+      "targets": "all"
+    },
+    "windows": [
+      {
+        "label": "main",
+        "title": "Audio Nodes",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 600,
+        "visible": false,
+        "decorations": false,
+        "resizable": true,
+        "backgroundColor": "#1a1a1a"
+      }
+    ]
+  }
+}

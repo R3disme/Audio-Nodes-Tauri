@@ -4,13 +4,16 @@
   "description": "Node-based audio mixer for Windows",
   "main": "./out/main/index.js",
   "scripts": {
-    "dev": "electron-vite dev",
-    "start": "electron-vite dev",
-    "build": "electron-vite build",
-    "preview": "electron-vite preview",
+    "dev": "tauri dev",
+    "start": "tauri dev",
+    "build": "tauri build",
+  "dev:renderer": "vite",
+    "preview": "vite preview",
+    "build:renderer": "vite build",
     "build:native": "npm --prefix native/audio-engine install --no-audit --no-fund && npm --prefix native/audio-engine run build"
   },
   "dependencies": {
+    "@tauri-apps/api": "^1.6.0",
     "audio-engine-native": "file:./native/audio-engine",
     "@electron-toolkit/preload": "^3.0.1",
     "@electron-toolkit/utils": "^3.0.0",
@@ -26,11 +29,13 @@
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
     "@vitejs/plugin-react": "^4.3.4",
+    "@tauri-apps/cli": "^1.6.0",
     "autoprefixer": "^10.4.20",
     "electron": "^33.3.1",
     "electron-vite": "^3.0.0",
     "postcss": "^8.5.1",
     "tailwindcss": "^3.4.17",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vite": "^5.4.14"
   }
 }

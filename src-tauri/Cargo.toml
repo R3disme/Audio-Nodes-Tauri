@@ -1,0 +1,19 @@
+[package]
+name = "audio-nodes"
+version = "1.0.0"
+description = "Audio Nodes desktop shell"
+authors = ["dev.r3d"]
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "1" }
+
+[dependencies]
+audio-engine-native = { path = "../native/audio-engine" }
+cpal = "0.15"
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "1", features = ["system-tray", "shell-open"] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

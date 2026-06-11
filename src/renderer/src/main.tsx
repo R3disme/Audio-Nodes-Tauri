@@ -1,5 +1,6 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
+import './platform/bridge'
 import { App } from './App'
 import { useAudioStore } from './store/audioStore'
 import { useSettingsStore } from './store/settingsStore'
